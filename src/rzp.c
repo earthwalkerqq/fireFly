@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -9,7 +10,8 @@
 
 const FrgIndex RZP_TILES[] = { {0, 0} };
 
-char getRZPMtrx(const char* path, FrgIndex index, int* heights) {
+
+char getRZPMtrx(const char* path, FrgIndex index, int* height) {
   char pathRZP[BUFFER_SIZE];
   snprintf(pathRZP, BUFFER_SIZE, "%s/RZP/%d/%d", path, index.i, index.j);
 
@@ -28,12 +30,13 @@ char getRZPMtrx(const char* path, FrgIndex index, int* heights) {
  size_t sizeRZPMtrx = RZP_MATRIX_SIZE * sizeof(int);
  size_t hasBeenRead = 0;
 
- if ((hasBeenRead = fread(heights, 1, sizeRZPMtrx, fd)) != sizeRZPMtrx) {
-   fprintf(stderr, "FILE HAS BEEN READING NOT FULL\n");
+ if ((hasBeenRead = fread(height, 1, sizeRZPMtrx, fd)) != sizeRZPMtrx) {
    if (!hasBeenRead) {
+     fprintf(stderr, "FAIL FROM READ FILE RZP\n");
      fclose(fd);
      return 0;
    }
+   fprintf(stderr, "FILE RZP HAS BEEN READING NOT FULL\n");
  }
  fclose(fd);
  return 1;

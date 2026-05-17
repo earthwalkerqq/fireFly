@@ -1,8 +1,9 @@
 APP_NAME := firefly
 
 CC       ?= cc
+CXX      ?= c++
 CFLAGS   ?= -Wall -Wextra -std=c11 -O2
-CPPFLAGS := -Iinclude
+CPPFLAGS := -Iinclude -Ideps -Ideps/delaunay
 LDFLAGS  :=
 
 SRC_DIR := src
@@ -10,6 +11,10 @@ OBJ_DIR := build
 
 SRCS := $(wildcard $(SRC_DIR)/*.c)
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+# Delaunay triangulation (delaunator-c, https://github.com/raintherrien/delaunator-c)
+TRI_SRC := deps/delaunay/delaunay.c
+TRI_OBJ := $(OBJ_DIR)/delaunay.o
+OBJS += $(TRI_OBJ)
 
 PKG_CONFIG ?= pkg-config
 PKG_PACKAGES := glfw3 glew cglm
@@ -25,7 +30,8 @@ ifeq ($(UNAME_S),Darwin)
 
   CPPFLAGS += -I$(GLFW_PREFIX)/include \
               -I$(GLEW_PREFIX)/include \
-              -I$(CGLM_PREFIX)/include
+              -I$(CGLM_PREFIX)/include \
+              -I.
 
   LDFLAGS  += -L$(GLFW_PREFIX)/lib \
               -L$(GLEW_PREFIX)/lib \
@@ -59,6 +65,9 @@ $(OBJ_DIR):
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(TRI_OBJ): $(TRI_SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c deps/delaunay/delaunay.c -o $@
 
 run: $(APP_NAME)
 	./$(APP_NAME)

@@ -21,6 +21,13 @@ extern char drawMode;
 #define WIN_WIDTH 1248
 #define WIN_HEIGHT 1024
 
+#ifndef FALSE
+#define FALSE 0
+#endif
+#ifndef TRUE
+#define TRUE 1
+#endif
+
 vec3 cameraPos = {0.f, 0.f, 0.f};
 vec3 cameraFront = {0.f, 1.f, 0.f};  // направление взгляда (по оси Y)
 vec3 cameraUp = {0.f, 0.f, 1.f};     // направление вверх (ось Z)
@@ -40,17 +47,16 @@ static GLFWwindow* _glfwGetWindow(int win_width, int win_height) {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-  GLFWwindow *window = glfwCreateWindow(win_width, win_height, "FireFly", NULL, NULL);
+  GLFWwindow *window = glfwCreateWindow(win_width, win_height, "FireFly", glfwGetPrimaryMonitor(), NULL);
   if (!window) {
     fprintf(stderr, "FAILED FROM CREATE A WINDOW\n");
     glfwTerminate();
     return NULL;
   }
 
-  glfwSetWindowPos(window, 150, 150);
   glfwMakeContextCurrent(window);
 
-  glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+  glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
   return window;
 }
 
@@ -58,10 +64,13 @@ static void _glSetup(void) {
   glClearColor(0.2f, 0.2f, 0.2f, 1.f);
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_VERTEX_PROGRAM_POINT_SIZE);
-  // При триангуляции/заливке лучше без blending (иначе выглядит размыто из-за overdraw)
+  glEnable(GL_CULL_FACE);
+  glCullFace(GL_BACK);
+  glFrontFace(GL_CCW);
   glDisable(GL_BLEND);
   glShadeModel(GL_SMOOTH);
   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+  glfwSwapInterval(1);
 }
 
 void keyCallback(GLFWwindow* window, float deltaTime) {
@@ -140,6 +149,15 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
     front[1] = sinf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // Y
     front[2] = sinf(glm_rad(pitch));                      // Z
     glm_vec3_normalize_to(front, cameraFront);
+}
+
+void mouseCallback(GLFWwindow* window, int button, int action, int __attribute__((unused)) mods) {
+    static int cursor_value = GLFW_CURSOR_NORMAL;
+
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+        cursor_value = (cursor_value == GLFW_CURSOR_HIDDEN) ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_HIDDEN;
+        glfwSetInputMode(window, GLFW_CURSOR, cursor_value);
+    }
 }
 
 void mainloop(GLFWwindow* window, TloRender* tlo, GLuint shaderProg) {
@@ -229,6 +247,8 @@ int main(int argc, char** argv) {
     glfwTerminate();
     return 1;
   }
+
+  glfwSetMouseButtonCallback(window, mouseCallback);
 
   // позиционируем камеру относительно загруженного облака точек
   float centerX = (tlo.minX + tlo.maxX) * 0.5f;

@@ -11,8 +11,6 @@ uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 
-uniform int u_renderMode;
-
 float getPointSize(float hR, float hP) {
   if (hR < 0) return 2.2;
   if (hP < 0) return 2.3;
