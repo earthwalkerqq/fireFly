@@ -5,6 +5,7 @@ layout (location = 1) in float CurHeight;
 
 out float ReliefHeight;
 out float PointHeight;
+out vec3  WorldPos;
 
 uniform float src_aspect;
 uniform mat4 model;
@@ -33,8 +34,10 @@ float getPointSize(float hR, float hP) {
 }
 
 void main(void) {
-  gl_Position = projection * view * model * vec4(VertexPos, 1.0);
+  vec4 world = model * vec4(VertexPos, 1.0);
+  gl_Position = projection * view * world;
   gl_PointSize = getPointSize(VertexPos.z, CurHeight);
   ReliefHeight = CurHeight;
   PointHeight = VertexPos.z;
+  WorldPos = world.xyz;
 }

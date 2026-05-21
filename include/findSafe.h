@@ -1,12 +1,75 @@
 #ifndef FIND_SAFE_H
 #define FIND_SAFE_H
 
+#include <stddef.h>
+
 #include "triangulation.h"
-#include "tlo.h"
 
-#define MAX_HEIGTH 5.
-#define ANGLE_SLOPE 0.1 // 10%
+/* Порог превышения точки над рельефом и предельный уклон (тангенс угла). */
+#define MAX_HEIGTH  5.0
+#define ANGLE_SLOPE 0.1 /* 10 % */
 
-void varifyTriangles(Triangle* tri, point_t* points, size_t size, TloRender* tlo);
+/**
+ * @brief Весовые коэффициенты интегрального показателя пригодности зоны.
+ * @details
+ * Определяют относительную значимость частных критериев и настраиваются
+ * под класс летательного аппарата и условия применения. Нормировку суммы
+ * выполняет сама функция ранжирования.
+ */
+typedef struct {
+  double wArea;      /**< вес площади зоны              */
+  double wMeanSlope; /**< вес среднего уклона           */
+  double wMaxSlope;  /**< вес максимального уклона      */
+  double wCompact;   /**< вес компактности формы        */
+  double wClearance; /**< вес запаса удаления от границ */
+} ZoneWeights;
+
+/**
+ * @brief Характеристики и ранг одной безопасной зоны посадки.
+ */
+typedef struct {
+  unsigned pid;         /**< идентификатор связной области             */
+  int      rank;        /**< ранг зоны: 0 — наиболее пригодная         */
+  size_t   triCount;    /**< число безопасных треугольников зоны       */
+  double   area;        /**< площадь ядра зоны                         */
+  double   meanSlope;   /**< средний уклон поверхности                 */
+  double   maxSlope;    /**< максимальный уклон                        */
+  double   compactness; /**< компактность формы, диапазон [0..1]       */
+  double   clearance;   /**< запас удаления от опасных границ          */
+  double   score;       /**< интегральный показатель пригодности       */
+} SafeZone;
+
+/**
+ * @brief Возвращает весовые коэффициенты по умолчанию.
+ */
+ZoneWeights zoneWeightsDefault(void);
+
+/**
+ * @brief Ранжирует безопасные зоны по интегральному показателю пригодности.
+ * @details
+ * Для каждой связной области, содержащей безопасные треугольники, вычисляются
+ * пять частных критериев (площадь, средний и максимальный уклон, компактность
+ * формы, запас удаления от границ). Критерии нормируются к диапазону [0..1] и
+ * свёртываются с весовыми коэффициентами в интегральный показатель @c score.
+ * Зоны сортируются по убыванию показателя; зоне с наибольшим показателем
+ * присваивается ранг 0.
+ *
+ * @param tri          Массив треугольников триангуляции.
+ * @param countTri     Количество треугольников.
+ * @param pts          Массив вершин, на которые ссылаются треугольники.
+ * @param triIsSafe    Признак безопасного треугольника (0/1), размер @p countTri.
+ * @param triClearance Удаление треугольника от опасных границ, размер @p countTri.
+ * @param maxPid       Наибольший идентификатор связной области.
+ * @param w            Весовые коэффициенты интегрального показателя.
+ * @param[out] outZones Массив зон, отсортированный по убыванию @c score.
+ *   Освобождается через @c free(); при отсутствии зон устанавливается в @c NULL.
+ * @param[out] triRank  Опциональный массив (размер @p countTri): для каждого
+ *   безопасного треугольника — ранг его зоны, для остальных — @c -1.
+ * @return Количество найденных безопасных зон.
+ */
+size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
+                     const unsigned char *triIsSafe, const double *triClearance,
+                     unsigned maxPid, ZoneWeights w,
+                     SafeZone **outZones, int *triRank);
 
 #endif

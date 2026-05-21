@@ -35,7 +35,7 @@ vec3 cameraUp = {0.f, 0.f, 1.f};     // направление вверх (ос�
 static float pitch = 0.f; // вертикальный поворот
 static float yaw = -90.f; // горизонтальный поворот
 
-static float cameraSpeed = 0.5f;
+static float cameraSpeed = 2.f;
 
 static GLFWwindow* _glfwGetWindow(int win_width, int win_height) {
   if (!glfwInit()) {
@@ -77,10 +77,13 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
     float currentSpeed = 20 * cameraSpeed * deltaTime;
 
     if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) {
-      drawMode = 1;
-    } 
+      drawMode = 1; // облако точек
+    }
     if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) {
-      drawMode = 2;
+      drawMode = 2; // серая триангуляционная сетка
+    }
+    if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) {
+      drawMode = 3; // сетка с безопасными зонами по рангу
     }
 
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
@@ -116,12 +119,12 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
         glm_vec3_scale(cameraUp, currentSpeed, resMul);
         glm_vec3_add(cameraPos, resMul, cameraPos);
     }
-    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-        glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
-        vec3 resMul;
-        glm_vec3_scale(cameraUp, currentSpeed, resMul);
-        glm_vec3_sub(cameraPos, resMul, cameraPos);
-    }
+    // if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+    //     glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+    //     vec3 resMul;
+    //     glm_vec3_scale(cameraUp, currentSpeed, resMul);
+    //     glm_vec3_sub(cameraPos, resMul, cameraPos);
+    // }
     if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
       yaw += 0.5f;
     }

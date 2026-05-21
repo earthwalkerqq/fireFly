@@ -8,9 +8,9 @@
 typedef struct {
   GLuint vao_points, vbo_points;
   GLuint vao_tri, vbo_tri;
-  GLuint ebo; // для триангуляции
-  GLuint ebo_safe; // безопасные зоны (подмножество треугольников)
-  GLsizei totalPoints, countTriangles, countTrianglesSafe;
+  GLuint ebo;                 // индексы всех треугольников триангуляции
+  GLuint vao_zone, vbo_zone;  // безопасные зоны: заливка с цветом по рангу
+  GLsizei totalPoints, countTriangles, countZoneVerts;
   char is_loaded;
 
   // границы облака точек (в мировых координатах)
@@ -19,9 +19,11 @@ typedef struct {
   float minZ, maxZ;
 } TloRender;
 
-// Режимы отрисовки 1 = облако точек , 2 = триангуляция
+// Режимы отрисовки: 1 = облако точек, 2 = серая триангуляционная сетка,
+//                   3 = сетка с безопасными зонами, окрашенными по рангу
 #define TLO_RENDER_POINTS 1
 #define TLO_RENDER_TRIANG 2
+#define TLO_RENDER_ZONES  3
 
 char initTlo(TloRender *tlo, const char *path, size_t *sizeTlo, int *countTlo);
 char loadAllTloData(TloRender *tlo, const char *path, size_t sizeTlo,
