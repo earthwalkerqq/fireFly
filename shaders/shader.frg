@@ -11,6 +11,7 @@ out vec4 FragColor;
 //   1 — заливка серой триангуляционной сетки
 //   2 — каркас рёбер сетки
 //   3 — заливка безопасных зон цветом по рангу пригодности
+//   4 — окружность посадочного круга в центре зоны (белая обводка)
 uniform int  u_pass;
 uniform vec3 u_meshColor;  // базовый цвет серой сетки
 uniform vec3 u_wireColor;  // цвет рёбер каркаса
@@ -60,7 +61,10 @@ void main(void)
     FragColor = vec4(u_meshColor * faceShade(), 1.0);
   } else if (u_pass == 2) {
     FragColor = vec4(u_wireColor, 1.0);
-  } else {
+  } else if (u_pass == 3) {
     FragColor = vec4(rankColor(ReliefHeight) * faceShade(), 1.0);
+  } else {
+    // u_pass == 4: посадочная окружность в центре зоны — белая обводка
+    FragColor = vec4(1.0, 1.0, 1.0, 1.0);
   }
 }

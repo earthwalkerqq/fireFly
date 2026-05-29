@@ -37,7 +37,8 @@ ifeq ($(UNAME_S),Darwin)
               -L$(CGLM_PREFIX)/lib
 
   LDLIBS   += -lglfw -lGLEW -lcglm \
-              -framework OpenGL -framework Cocoa -framework IOKit -framework CoreVideo -lm
+              -framework OpenGL -framework Cocoa -framework IOKit \
+              -framework CoreVideo -lm -framework OpenCL
 else ifeq ($(UNAME_S),Linux)
   ifeq ($(HAVE_PKGCONFIG),1)
     PKG_CFLAGS := $(shell $(PKG_CONFIG) --cflags $(PKG_PACKAGES) 2>/dev/null)
@@ -50,6 +51,19 @@ else ifeq ($(UNAME_S),Linux)
   endif
 else
   LDLIBS += -lglfw -lGLEW -lGL -lcglm -lm
+endif
+
+# --- опциональная поддержка OpenCL: сборка командой `make OPENCL=1` ---
+# По умолчанию выключена: проект собирается и работает без OpenCL SDK,
+# вычисления при этом выполняются на CPU (pthreads).
+OPENCL ?= 0
+ifeq ($(OPENCL),1)
+  CPPFLAGS += -DUSE_OPENCL
+  ifeq ($(UNAME_S),Darwin)
+    LDLIBS += -framework OpenCL
+  else
+    LDLIBS += -lOpenCL
+  endif
 endif
 
 .PHONY: all clean run

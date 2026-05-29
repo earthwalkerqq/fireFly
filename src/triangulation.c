@@ -7,13 +7,31 @@
 #include <unistd.h>
 
 #include "triangulation.h"
+#include "common.h"
 
-#define MAX_TRIANG_POINTS 12000
+#define MAX_TRIANG_POINTS_DEFAULT 12000
 #define TRI_MAX_WORKERS 8
 #define TRI_PARALLEL_MIN_ITEMS 512
+#define HILBERT_ORDER 16          /* разрешение сетки Гильберта: сторона 2^16 */
 #define POINT_EPS 1e-6
 #define AREA_EPS 1e-12
 #define CIRCLE_EPS 1e-9
+#define CAP_DEFAULT 64
+
+/*
+ * Предельное число точек, передаваемых в триангуляцию.
+ * управляется в реальном времени через triangulation_set_max_points().
+ */
+static int g_max_triang_points = MAX_TRIANG_POINTS_DEFAULT;
+
+void triangulation_set_max_points(int maxPoints) {
+  if (maxPoints < 64) maxPoints = 64;
+  g_max_triang_points = maxPoints;
+}
+
+int triangulation_get_max_points(void) {
+  return g_max_triang_points;
+}
 
 #ifndef INFINITY
 #define INFINITY 1e30
@@ -21,31 +39,40 @@
 
 /**
  * @brief Внутреннее представление треугольника Bowyer-Watson.
+ * @details Помимо индексов вершин и описанной окружности хранит индексы
+ * соседних треугольников по каждому ребру: @c n[0] — сосед по ребру
+ * (p[0],p[1]), @c n[1] — по (p[1],p[2]), @c n[2] — по (p[2],p[0]); @c -1,
+ * если соседа нет. Смежность позволяет находить каверну вставляемой точки
+ * локальным обходом, не перебирая все треугольники.
  */
 typedef struct {
-  int p1, p2, p3;
-  double cx, cy, r2;
-  unsigned char alive;
+  int p[3];               /**< Индексы вершин (обход против часовой стрелки). */
+  int n[3];               /**< Соседи по рёбрам или -1. */
+  double cx, cy, r2;      /**< Центр и квадрат радиуса описанной окружности. */
+  unsigned char alive;    /**< Жив ли треугольник. */
+  unsigned char visited;  /**< Метка обхода каверны (сбрасывается после вставки). */
 } bw_triangle_t;
 
 /**
- * @brief Ненаправленное ребро границы "дыры" при вставке точки.
+ * @brief Сетка треугольников Bowyer-Watson с переиспользованием слотов.
+ * @details Удалённые треугольники не сдвигают массив (это разрушило бы
+ * индексы смежности), а складываются в список свободных слотов и
+ * переиспользуются при создании новых треугольников.
  */
 typedef struct {
-  int a, b;
-} bw_edge_t;
+  bw_triangle_t* tris;
+  size_t count, cap;
+  int* freeList;          /**< Стек индексов освобождённых слотов. */
+  size_t freeCount, freeCap;
+} bw_mesh_t;
 
 /**
- * @brief Аргументы потока для проверки описанных окружностей.
+ * @brief Сортировочный ключ для упорядочивания точек по кривой Гильберта.
  */
 typedef struct {
-  const bw_triangle_t* triangles;
-  const point_t* points;
-  const point_t* point;
-  unsigned char* bad;
-  size_t begin;
-  size_t end;
-} circle_worker_t;
+  uint64_t key;
+  int idx;
+} hkey_t;
 
 /**
  * @brief Аргументы потока для применения tri_correct_fn.
@@ -67,7 +94,7 @@ typedef struct {
 } edge_item_t;
 
 /**
- * @brief Вычисляет ориентированную удвоенную площадь треугольника в XY.
+ * @brief Вычисляет ориентированную удвоенную площадь треугольника в XY
  */
 static double orient2d(const point_t* a, const point_t* b, const point_t* c) {
   return ((double)b->x - (double)a->x) * ((double)c->y - (double)a->y) -
@@ -75,7 +102,8 @@ static double orient2d(const point_t* a, const point_t* b, const point_t* c) {
 }
 
 /**
- * @brief Сравнивает точки по XY для qsort.
+ * @brief Сравнивает точки по XY для qsort
+ * @return 1 - т. a больше т. b; -1 - т. a меньше т. b; 0 - точки равны и по x и по y
  */
 static int cmp_point_xy(const void* lhs, const void* rhs) {
   const point_t* a = (const point_t*)lhs;
@@ -96,10 +124,98 @@ static int same_point_xy(const point_t* a, const point_t* b) {
 }
 
 /**
+ * @brief Переводит координаты ячейки (x,y) в расстояние вдоль кривой Гильберта.
+ * @details Классический алгоритм d = xy2d для квадрата со стороной @p n
+ * (степень двойки). Кривая Гильберта обходит плоскость так, что соседние по
+ * номеру ячейки близки в пространстве, поэтому упорядочивание точек по этому
+ * номеру даёт сильную пространственную локальность.
+ */
+static uint64_t hilbert_xy2d(uint32_t n, uint32_t x, uint32_t y) {
+  uint64_t d = 0;
+  for (uint32_t s = n / 2; s > 0; s /= 2) {
+    uint32_t rx = (x & s) ? 1u : 0u;
+    uint32_t ry = (y & s) ? 1u : 0u;
+    d += (uint64_t)s * (uint64_t)s * ((3u * rx) ^ ry);
+    /* поворот квадранта */
+    if (ry == 0) {
+      if (rx == 1) {
+        x = n - 1 - x;
+        y = n - 1 - y;
+      }
+      uint32_t t = x;
+      x = y;
+      y = t;
+    }
+  }
+  return d;
+}
+
+/**
+ * @brief Сравнивает ключи Гильберта для qsort.
+ */
+static int cmp_hkey(const void* lhs, const void* rhs) {
+  const hkey_t* a = (const hkey_t*)lhs;
+  const hkey_t* b = (const hkey_t*)rhs;
+  if (a->key < b->key) return -1;
+  if (a->key > b->key) return 1;
+  return 0;
+}
+
+/**
+ * @brief Переупорядочивает точки вдоль кривой Гильберта.
+ * @details Координаты XY отображаются на квадратную сетку 2^HILBERT_ORDER,
+ * для каждой ячейки вычисляется её номер на кривой Гильберта, после чего
+ * точки сортируются по этому номеру. В результате последовательно
+ * вставляемые в триангуляцию точки оказываются пространственно близкими,
+ * что позволяет находить каверну локальным обходом смежных треугольников.
+ * При нехватке памяти исходный порядок сохраняется (на корректность не влияет).
+ */
+static void hilbert_sort(point_t* points, int n) {
+  if (n < 2)
+    return;
+
+  double min_x = points[0].x, max_x = points[0].x;
+  double min_y = points[0].y, max_y = points[0].y;
+  for (int i = 1; i < n; i++) {
+    if (points[i].x < min_x) min_x = points[i].x;
+    else if (points[i].x > max_x) max_x = points[i].x;
+    if (points[i].y < min_y) min_y = points[i].y;
+    else if (points[i].y > max_y) max_y = points[i].y;
+  }
+
+  const uint32_t side = 1u << HILBERT_ORDER;
+  double sx = (max_x > min_x) ? (max_x - min_x) : 1.0;
+  double sy = (max_y > min_y) ? (max_y - min_y) : 1.0;
+
+  hkey_t* keys = (hkey_t*)malloc((size_t)n * sizeof(hkey_t));
+  point_t* tmp = (point_t*)malloc((size_t)n * sizeof(point_t));
+  if (!keys || !tmp) {
+    free(keys);
+    free(tmp);
+    return;
+  }
+
+  for (int i = 0; i < n; i++) {
+    uint32_t gx = (uint32_t)(((double)points[i].x - min_x) / sx * (side - 1));
+    uint32_t gy = (uint32_t)(((double)points[i].y - min_y) / sy * (side - 1));
+    keys[i].key = hilbert_xy2d(side, gx, gy);
+    keys[i].idx = i;
+  }
+
+  qsort(keys, (size_t)n, sizeof(hkey_t), cmp_hkey);
+
+  for (int i = 0; i < n; i++)
+    tmp[i] = points[keys[i].idx];
+  memcpy(points, tmp, (size_t)n * sizeof(point_t));
+
+  free(keys);
+  free(tmp);
+}
+
+/**
  * @brief Возвращает рекомендуемое число потоков для заданного объема работы.
- * @details
- * По умолчанию используется число доступных CPU, но не больше TRI_MAX_WORKERS.
- * Для отладки можно задать переменную окружения FIREFLY_TRI_THREADS.
+ * @details По умолчанию используется число доступных CPU, но не больше TRI_MAX_WORKERS.
+ * Для отладки можно задать переменную окружения
  */
 static int triangulation_worker_count(size_t work_items) {
   if (work_items < TRI_PARALLEL_MIN_ITEMS)
@@ -129,14 +245,21 @@ static int triangulation_worker_count(size_t work_items) {
 }
 
 /**
- * @brief Прореживает большое облако точек до MAX_TRIANG_POINTS.
+ * @brief Прореживает большое облако точек до текущего предела густоты сетки.
  * @details
- * Область разбивается на равномерную сетку; из каждой занятой ячейки остается
- * точка, ближайшая к центру ячейки. Это сохраняет покрытие площади и удерживает
- * Bowyer-Watson в приемлемой сложности для интерактивной отрисовки.
+  Область разбивается на равномерную сетку; все точки, попавшие в одну
+  ячейку, заменяются одной точкой — усреднённым центроидом ячейки
+  (стандартное воксельное прореживание облаков точек).
+  Предел задаётся переменной @c g_max_triang_points и
+  регулируется в реальном времени.
+  p.s. Пробовал делать 1. с выборором той точки, которая будет ближе всех к центру ячейки;
+  2. с выбором точки, которая явлсяется локальным максимумом в ячейке. В первом случае, при выборе
+  большого размера конечного элемента сетки, не учитываются возможные припятствия, а во втором
+  случает сетка получается сильно шероховатой. 
  */
 static int subsample(point_t* points, int n) {
-  if (n <= MAX_TRIANG_POINTS)
+  int maxPoints = g_max_triang_points;
+  if (n <= maxPoints)
     return n;
 
   double min_x = points[0].x, max_x = points[0].x;
@@ -148,24 +271,28 @@ static int subsample(point_t* points, int n) {
     else if (points[i].y > max_y) max_y = points[i].y;
   }
 
-  int g = (int)ceil(sqrt((double)MAX_TRIANG_POINTS));
+  int g = (int)ceil(sqrt((double)maxPoints)); // размер регулярной сетки
   if (g < 3) g = 3;
 
-  int* best = (int*)calloc((size_t)(g * g), sizeof(int));
-  double* d2 = (double*)malloc((size_t)(g * g) * sizeof(double));
-  if (!best || !d2) {
+  // аккумуляторы координат по ячейкам сетки
+  size_t cells = (size_t)g * (size_t)g;
+  double* accX = (double*)calloc(cells, sizeof(double)); // сумма координат X
+  double* accY = (double*)calloc(cells, sizeof(double)); // сумма координат Y
+  double* accZ = (double*)calloc(cells, sizeof(double)); // сумма координат Z
+  double* accH = (double*)calloc(cells, sizeof(double)); // сумма высот рельефа (только для точек с корректной высотой)
+  int*    cnt  = (int*)calloc(cells, sizeof(int)); // общее число точек в ячейке
+  int*    cntH = (int*)calloc(cells, sizeof(int)); // количество точек в ячейке, у которых height >= 0
+  if (!accX || !accY || !accZ || !accH || !cnt || !cntH) {
     fprintf(stderr, "FAIL FROM MEMORY ALLOCATE\n");
-    free(best);
-    free(d2);
+    memDestroy(6, accX, accY, accZ, accH, cnt, cntH);
     return n;
   }
 
-  for (int i = 0; i < g * g; i++)
-    d2[i] = INFINITY;
-
+  // размер ячейки
   double sx = (max_x > min_x) ? (max_x - min_x) / g : 1.0;
   double sy = (max_y > min_y) ? (max_y - min_y) / g : 1.0;
 
+  // распределяем точки по ячейкам
   for (int i = 0; i < n; i++) {
     int gx = (int)(((double)points[i].x - min_x) / sx);
     int gy = (int)(((double)points[i].y - min_y) / sy);
@@ -175,35 +302,40 @@ static int subsample(point_t* points, int n) {
     if (gy >= g) gy = g - 1;
     else if (gy < 0) gy = 0;
 
-    int idx = gy * g + gx;
-    double cx = min_x + (gx + 0.5) * sx;
-    double cy = min_y + (gy + 0.5) * sy;
-    double dx = (double)points[i].x - cx;
-    double dy = (double)points[i].y - cy;
-    double dist = dx * dx + dy * dy;
-
-    if (dist < d2[idx]) {
-      d2[idx] = dist;
-      best[idx] = i;
+    int idx = gy * g + gx; // линейный индекс
+    accX[idx] += points[i].x;
+    accY[idx] += points[i].y;
+    accZ[idx] += points[i].z;
+    cnt[idx]++;
+    /* высота рельефа усредняется только по точкам с её определённым
+       значением; ячейку без таких точек считаем без данных рельефа */
+    if (points[i].height >= 0.0f) {
+      accH[idx] += points[i].height;
+      cntH[idx]++;
     }
   }
 
-  point_t* tmp = (point_t*)malloc((size_t)(g * g) * sizeof(point_t));
+  point_t* tmp = (point_t*)malloc(cells * sizeof(point_t));
   if (!tmp) {
     fprintf(stderr, "FAIL FROM MEMORY ALLOCATE\n");
-    free(best);
-    free(d2);
+    memDestroy(6, accX, accY, accZ, accH, cnt, cntH);
     return n;
   }
 
   int out = 0;
-  for (int i = 0; i < g * g; i++) {
-    if (d2[i] < INFINITY)
-      tmp[out++] = points[best[i]];
+  for (size_t i = 0; i < cells; i++) {
+    if (cnt[i] == 0) continue;
+    point_t p = {
+      .x = (float)(accX[i] / cnt[i]),
+      .y = (float)(accY[i] / cnt[i]),
+      .z = (float)(accZ[i] / cnt[i]),
+      .height = (cntH[i] > 0) ? (float)(accH[i] / cntH[i]) : -1.0f,
+      .id = out
+    };
+    tmp[out++] = p;
   }
 
-  free(best);
-  free(d2);
+  memDestroy(6, accX, accY, accZ, accH, cnt, cntH);
 
   if (out >= 3) {
     memcpy(points, tmp, (size_t)out * sizeof(point_t));
@@ -223,6 +355,7 @@ static int normalize_points(point_t* points, int n) {
   if (n < 3)
     return n;
 
+  /* сортировка по XY нужна только для удаления дубликатов */
   qsort(points, (size_t)n, sizeof(point_t), cmp_point_xy);
 
   int out = 1;
@@ -231,37 +364,55 @@ static int normalize_points(point_t* points, int n) {
       points[out++] = points[i];
   }
 
+  /* итоговый порядок вставки — вдоль кривой Гильберта (локальность каверны) */
+  hilbert_sort(points, out);
+
   return out;
 }
 
 /**
  * @brief Вычисляет окружность, описанную вокруг треугольника.
+ * @details вычисляется через определитель матрицы, который равен удвоенной
+ * ориентированной площади треугольника:
+ *         | ax ay 1 |
+ * d = 2 * | bx by 1 |
+​ *         | cx cy 1 |
+ * @param cpx - координата центра окр-ти по X
+ * @param cpy - координата центра окр-ти по Y
+ * @param r2 - удвоенный радиус окр-ти
  */
 static int compute_circumcircle(const point_t* points, int a, int b, int c,
-                                double* cx, double* cy, double* r2) {
+                                double* cpx, double* cpy, double* r2) {
   const point_t* p1 = &points[a];
   const point_t* p2 = &points[b];
   const point_t* p3 = &points[c];
 
   double ax = p1->x, ay = p1->y;
   double bx = p2->x, by = p2->y;
-  double cxp = p3->x, cyp = p3->y;
+  double cx = p3->x, cy = p3->y;
 
-  double d = 2.0 * (ax * (by - cyp) + bx * (cyp - ay) + cxp * (ay - by));
-  if (fabs(d) <= AREA_EPS)
+  double d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+  if (fabs(d) <= AREA_EPS) // вырожденный случай
     return 0;
+
+  /* Центр описанной окружности находится на пересечении серединных перпендикуляров.
+  В координатной форме решение системы уравнений:
+   (x - ax)² + (y - ay)² = r2
+   (x - bx)² + (y - by)² = r2
+   (x - cx)² + (y - cy)² = r2
+  */
 
   double ax2ay2 = ax * ax + ay * ay;
   double bx2by2 = bx * bx + by * by;
-  double cx2cy2 = cxp * cxp + cyp * cyp;
+  double cx2cy2 = cx * cx + cy * cy;
 
-  *cx = (ax2ay2 * (by - cyp) + bx2by2 * (cyp - ay) +
+  *cpx = (ax2ay2 * (by - cy) + bx2by2 * (cy - ay) +
          cx2cy2 * (ay - by)) / d;
-  *cy = (ax2ay2 * (cxp - bx) + bx2by2 * (ax - cxp) +
+  *cpy = (ax2ay2 * (cx - bx) + bx2by2 * (ax - cx) +
          cx2cy2 * (bx - ax)) / d;
 
-  double dx = *cx - ax;
-  double dy = *cy - ay;
+  double dx = *cpx - ax;
+  double dy = *cpy - ay;
   *r2 = dx * dx + dy * dy;
   return *r2 > AREA_EPS;
 }
@@ -269,63 +420,83 @@ static int compute_circumcircle(const point_t* points, int a, int b, int c,
 /**
  * @brief Расширяет массив внутренних треугольников.
  */
-static int reserve_bw_triangles(bw_triangle_t** triangles, size_t* cap,
-                                size_t need) {
-  if (need <= *cap)
+/**
+ * @brief Расширяет массив треугольников сетки до требуемого размера.
+ */
+static int reserve_bw_triangles(bw_mesh_t* m, size_t need) {
+  if (need <= m->cap)
     return 1;
 
-  size_t new_cap = *cap ? *cap : 64;
+  size_t new_cap = m->cap ? m->cap : 64;
   while (new_cap < need)
     new_cap *= 2;
 
   bw_triangle_t* resized =
-      (bw_triangle_t*)realloc(*triangles, new_cap * sizeof(bw_triangle_t));
+      (bw_triangle_t*)realloc(m->tris, new_cap * sizeof(bw_triangle_t));
   if (!resized)
     return 0;
 
-  *triangles = resized;
-  *cap = new_cap;
+  m->tris = resized;
+  m->cap = new_cap;
   return 1;
 }
 
 /**
- * @brief Добавляет внутренний треугольник с CCW-ориентацией.
+ * @brief Складывает индекс освобождённого слота в список свободных.
  */
-static int append_bw_triangle(bw_triangle_t** triangles, size_t* count,
-                              size_t* cap, const point_t* points,
-                              int a, int b, int c) {
-  double area = orient2d(&points[a], &points[b], &points[c]);
-  if (fabs(area) <= AREA_EPS)
-    return 1;
+static int bw_push_free(bw_mesh_t* m, int idx) {
+  if (m->freeCount == m->freeCap) {
+    size_t nc = m->freeCap ? m->freeCap * 2 : 64;
+    int* r = (int*)realloc(m->freeList, nc * sizeof(int));
+    if (!r)
+      return 0;
+    m->freeList = r;
+    m->freeCap = nc;
+  }
+  m->freeList[m->freeCount++] = idx;
+  return 1;
+}
 
-  if (area < 0.0) {
-    int tmp = b;
-    b = c;
-    c = tmp;
+/**
+ * @brief Создаёт треугольник с заданным порядком вершин (без переориентации).
+ * @details Вызывающий обязан передать вершины против часовой стрелки.
+ * Свободный слот переиспользуется, иначе массив растёт. Вырожденный
+ * треугольник получает r2 = -1 и никогда не считается «плохим», что
+ * сохраняет целостность смежности.
+ * @return Индекс созданного треугольника или -1 при нехватке памяти.
+ */
+static int bw_new_triangle(bw_mesh_t* m, const point_t* points,
+                           int a, int b, int c) {
+  double cx = 0.0, cy = 0.0, r2 = -1.0;
+  if (!compute_circumcircle(points, a, b, c, &cx, &cy, &r2)) {
+    cx = 0.0; cy = 0.0; r2 = -1.0;
   }
 
-  double cx = 0.0, cy = 0.0, r2 = 0.0;
-  if (!compute_circumcircle(points, a, b, c, &cx, &cy, &r2))
-    return 1;
+  size_t idx;
+  if (m->freeCount > 0) {
+    idx = (size_t)m->freeList[--m->freeCount];
+  } else {
+    if (!reserve_bw_triangles(m, m->count + 1))
+      return -1;
+    idx = m->count++;
+  }
 
-  if (!reserve_bw_triangles(triangles, cap, *count + 1))
-    return 0;
-
-  (*triangles)[*count] = (bw_triangle_t){
-    .p1 = a, .p2 = b, .p3 = c,
+  m->tris[idx] = (bw_triangle_t){
+    .p = { a, b, c },
+    .n = { -1, -1, -1 },
     .cx = cx, .cy = cy, .r2 = r2,
-    .alive = 1
+    .alive = 1, .visited = 0
   };
-  (*count)++;
-  return 1;
+  return (int)idx;
 }
 
 /**
  * @brief Проверяет попадание точки внутрь описанной окружности треугольника.
+ * @details Если расстояние от точки до центра больше радиуса — не входит.
  */
 static int point_in_circumcircle(const bw_triangle_t* tri,
                                  const point_t* point) {
-  if (!tri->alive)
+  if (!tri->alive || tri->r2 < 0.0)
     return 0;
 
   double dx = (double)point->x - tri->cx;
@@ -336,135 +507,227 @@ static int point_in_circumcircle(const bw_triangle_t* tri,
 }
 
 /**
- * @brief Рабочая функция потока для поиска плохих треугольников.
+ * @brief Находит ребро соседа @p nb, ведущее обратно в треугольник @p t.
  */
-static void* mark_bad_worker(void* arg) {
-  circle_worker_t* job = (circle_worker_t*)arg;
-  (void)job->points;
-  for (size_t i = job->begin; i < job->end; i++)
-    job->bad[i] = (unsigned char)point_in_circumcircle(&job->triangles[i],
-                                                       job->point);
-  return NULL;
+static int bw_back_edge(const bw_mesh_t* m, int nb, int t) {
+  const bw_triangle_t* tn = &m->tris[nb];
+  for (int e = 0; e < 3; e++)
+    if (tn->n[e] == t)
+      return e;
+  return -1;
 }
 
 /**
- * @brief Параллельно помечает треугольники, нарушенные новой точкой.
+ * @brief Локализует треугольник, содержащий точку, «шагая» по смежности.
+ * @details Старт из подсказки @p hint (обычно треугольник предыдущей
+ * вставки — при гильбертовом порядке он рядом). На каждом шаге переходим
+ * через ребро, относительно которого точка лежит снаружи. Так как точки
+ * вставляются внутрь супертреугольника, обход всегда завершается; счётчик
+ * @c guard страхует от зацикливания на вырожденных конфигурациях.
+ * @return Индекс найденного треугольника или -1.
  */
-static void mark_bad_triangles(const bw_triangle_t* triangles, size_t count,
-                               const point_t* points, const point_t* point,
-                               unsigned char* bad) {
-  int workers = triangulation_worker_count(count);
-  if (workers <= 1) {
-    circle_worker_t job = {
-      .triangles = triangles,
-      .points = points,
-      .point = point,
-      .bad = bad,
-      .begin = 0,
-      .end = count
-    };
-    (void)mark_bad_worker(&job);
-    return;
+static int bw_locate(const bw_mesh_t* m, int hint, const point_t* points,
+                     const point_t* p) {
+  int cur = (hint >= 0 && (size_t)hint < m->count && m->tris[hint].alive)
+                ? hint : -1;
+  if (cur < 0) {
+    for (size_t i = 0; i < m->count; i++)
+      if (m->tris[i].alive) { cur = (int)i; break; }
   }
+  if (cur < 0)
+    return -1;
 
-  pthread_t threads[TRI_MAX_WORKERS];
-  circle_worker_t jobs[TRI_MAX_WORKERS];
-  size_t chunk = (count + (size_t)workers - 1) / (size_t)workers;
-  int created = 0;
-
-  for (int i = 0; i < workers; i++) {
-    size_t begin = (size_t)i * chunk;
-    size_t end = begin + chunk;
-    if (begin >= count) break;
-    if (end > count) end = count;
-
-    jobs[i] = (circle_worker_t){
-      .triangles = triangles,
-      .points = points,
-      .point = point,
-      .bad = bad,
-      .begin = begin,
-      .end = end
-    };
-
-    if (pthread_create(&threads[i], NULL, mark_bad_worker, &jobs[i]) != 0)
-      break;
-    created++;
+  size_t guard = 4 * m->count + 16;
+  for (size_t step = 0; step < guard; step++) {
+    const bw_triangle_t* t = &m->tris[cur];
+    int moved = 0;
+    for (int e = 0; e < 3; e++) {
+      const point_t* u = &points[t->p[e]];
+      const point_t* v = &points[t->p[(e + 1) % 3]];
+      if (orient2d(u, v, p) < 0.0) {
+        int nb = t->n[e];
+        if (nb >= 0) {
+          cur = nb;
+          moved = 1;
+          break;
+        }
+      }
+    }
+    if (!moved)
+      return cur;
   }
-
-  if (created != workers) {
-    for (int i = 0; i < created; i++)
-      pthread_join(threads[i], NULL);
-    circle_worker_t job = {
-      .triangles = triangles,
-      .points = points,
-      .point = point,
-      .bad = bad,
-      .begin = 0,
-      .end = count
-    };
-    (void)mark_bad_worker(&job);
-    return;
-  }
-
-  for (int i = 0; i < created; i++)
-    pthread_join(threads[i], NULL);
+  return cur;
 }
 
+#define BW_GROW_INT(buf, cap, cnt)                         \
+  do {                                                     \
+    if ((cnt) == *(cap)) {                                 \
+      size_t nc = *(cap) ? *(cap) * 2 : 64;                \
+      int* r = (int*)realloc(*(buf), nc * sizeof(int));    \
+      if (!r) return 0;                                    \
+      *(buf) = r; *(cap) = nc;                             \
+    }                                                      \
+  } while (0)
+
 /**
- * @brief Добавляет ребро в границу или удаляет его, если оно уже внутреннее.
+ * @brief Вставляет точку @p pi, перестраивая каверну Делоне локально.
+ * @details
+ *  1. Находим стартовый «плохой» треугольник (его описанная окружность
+ *     содержит точку) локализацией по смежности — без перебора всех
+ *     треугольников.
+ *  2. Обходом в ширину собираем всю каверну — связную область плохих
+ *     треугольников.
+ *  3. Снимаем граничные рёбра каверны и достраиваем веер новых
+ *     треугольников к точке, восстанавливая смежность.
+ *
+ * Все рабочие буферы передаются извне и переиспользуются между вставками,
+ * чтобы не выделять память на каждую точку.
+ * @param[in,out] hint Подсказка локализации; на выходе — один из новых
+ *   треугольников рядом с точкой.
+ * @return 1 при успехе, 0 при нехватке памяти.
  */
-static int toggle_boundary_edge(bw_edge_t** edges, size_t* count, size_t* cap,
-                                int a, int b) {
-  if (a == b)
-    return 1;
-  if (a > b) {
-    int tmp = a;
-    a = b;
-    b = tmp;
+static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
+                           int* hint,
+                           int** stackBuf, size_t* stackCap,
+                           int** touchedBuf, size_t* touchedCap,
+                           int** newBuf, size_t* newCap,
+                           int** bndA, int** bndB, int** bndOt, int** bndOe,
+                           size_t* bndCap) {
+  const point_t* p = &points[pi];
+
+  int seed = bw_locate(m, *hint, points, p);
+  if (seed < 0 || !point_in_circumcircle(&m->tris[seed], p)) {
+    /* запасной путь: ищем любой плохой треугольник перебором */
+    seed = -1;
+    for (size_t i = 0; i < m->count; i++) {
+      if (m->tris[i].alive && point_in_circumcircle(&m->tris[i], p)) {
+        seed = (int)i;
+        break;
+      }
+    }
+    if (seed < 0)
+      return 1; /* точка не нарушает ни одной окружности — пропускаем */
   }
 
-  for (size_t i = 0; i < *count; i++) {
-    if ((*edges)[i].a == a && (*edges)[i].b == b) {
-      (*edges)[i] = (*edges)[*count - 1];
-      (*count)--;
-      return 1;
+  /* --- обход в ширину: собираем каверну плохих треугольников --- */
+  size_t stackCnt = 0, touchedCnt = 0;
+
+  BW_GROW_INT(stackBuf, stackCap, stackCnt);
+  (*stackBuf)[stackCnt++] = seed;
+  m->tris[seed].visited = 1;
+  BW_GROW_INT(touchedBuf, touchedCap, touchedCnt);
+  (*touchedBuf)[touchedCnt++] = seed;
+
+  while (stackCnt > 0) {
+    int t = (*stackBuf)[--stackCnt];
+    for (int e = 0; e < 3; e++) {
+      int nb = m->tris[t].n[e];
+      if (nb < 0 || m->tris[nb].visited)
+        continue;
+      if (m->tris[nb].alive && point_in_circumcircle(&m->tris[nb], p)) {
+        m->tris[nb].visited = 1;
+        BW_GROW_INT(touchedBuf, touchedCap, touchedCnt);
+        (*touchedBuf)[touchedCnt++] = nb;
+        BW_GROW_INT(stackBuf, stackCap, stackCnt);
+        (*stackBuf)[stackCnt++] = nb;
+      }
     }
   }
 
-  if (*count == *cap) {
-    size_t new_cap = *cap ? *cap * 2 : 64;
-    bw_edge_t* resized = (bw_edge_t*)realloc(*edges,
-                                             new_cap * sizeof(bw_edge_t));
-    if (!resized)
-      return 0;
-    *edges = resized;
-    *cap = new_cap;
+  /* помечаем плохие треугольники мёртвыми — для теста границы каверны */
+  for (size_t i = 0; i < touchedCnt; i++)
+    m->tris[(*touchedBuf)[i]].alive = 0;
+
+  /* --- граничные рёбра каверны --- */
+  size_t bndCnt = 0;
+  for (size_t i = 0; i < touchedCnt; i++) {
+    int t = (*touchedBuf)[i];
+    for (int e = 0; e < 3; e++) {
+      int nb = m->tris[t].n[e];
+      /* ребро граничное, если снаружи нет треугольника либо он жив
+         (то есть не входит в каверну) */
+      if (nb >= 0 && !m->tris[nb].alive)
+        continue;
+
+      if (bndCnt == *bndCap) {
+        size_t nc = *bndCap ? *bndCap * 2 : 64;
+        int* ra = (int*)realloc(*bndA, nc * sizeof(int));
+        int* rb = (int*)realloc(*bndB, nc * sizeof(int));
+        int* rt = (int*)realloc(*bndOt, nc * sizeof(int));
+        int* re = (int*)realloc(*bndOe, nc * sizeof(int));
+        if (ra) *bndA = ra;
+        if (rb) *bndB = rb;
+        if (rt) *bndOt = rt;
+        if (re) *bndOe = re;
+        if (!ra || !rb || !rt || !re)
+          return 0;
+        *bndCap = nc;
+      }
+
+      (*bndA)[bndCnt]  = m->tris[t].p[e];
+      (*bndB)[bndCnt]  = m->tris[t].p[(e + 1) % 3];
+      (*bndOt)[bndCnt] = nb;
+      (*bndOe)[bndCnt] = (nb >= 0) ? bw_back_edge(m, nb, t) : -1;
+      bndCnt++;
+    }
   }
 
-  (*edges)[*count] = (bw_edge_t){ .a = a, .b = b };
-  (*count)++;
+  /* освобождённые слоты плохих треугольников можно переиспользовать */
+  for (size_t i = 0; i < touchedCnt; i++) {
+    m->tris[(*touchedBuf)[i]].visited = 0;
+    if (!bw_push_free(m, (*touchedBuf)[i]))
+      return 0;
+  }
+
+  /* --- веер новых треугольников (a, b, p) + восстановление смежности --- */
+  if (bndCnt > *newCap) {
+    int* r = (int*)realloc(*newBuf, bndCnt * sizeof(int));
+    if (!r) return 0;
+    *newBuf = r;
+    *newCap = bndCnt;
+  }
+
+  for (size_t i = 0; i < bndCnt; i++) {
+    /* (a,b) — ребро каверны (интерьер слева), p внутри => (a,b,p) уже CCW */
+    int nt = bw_new_triangle(m, points, (*bndA)[i], (*bndB)[i], pi);
+    if (nt < 0)
+      return 0;
+    (*newBuf)[i] = nt;
+    /* ребро 0 = (a,b) — наружу каверны */
+    m->tris[nt].n[0] = (*bndOt)[i];
+    if ((*bndOt)[i] >= 0 && (*bndOe)[i] >= 0)
+      m->tris[(*bndOt)[i]].n[(*bndOe)[i]] = nt;
+  }
+
+  /* связываем «спицы»: рёбра (b,p)=1 и (p,a)=2 соседних новых треугольников
+     по их общей вершине, отличной от p */
+  for (size_t i = 0; i < bndCnt; i++) {
+    for (size_t j = i + 1; j < bndCnt; j++) {
+      int ai = (*bndA)[i], bi = (*bndB)[i];
+      int aj = (*bndA)[j], bj = (*bndB)[j];
+      int v = -1;
+      if (ai == aj || ai == bj) v = ai;
+      else if (bi == aj || bi == bj) v = bi;
+      if (v < 0)
+        continue;
+      int ei = (v == bi) ? 1 : 2;
+      int ej = (v == bj) ? 1 : 2;
+      m->tris[(*newBuf)[i]].n[ei] = (*newBuf)[j];
+      m->tris[(*newBuf)[j]].n[ej] = (*newBuf)[i];
+    }
+  }
+
+  if (bndCnt > 0)
+    *hint = (*newBuf)[bndCnt - 1];
   return 1;
 }
 
-/**
- * @brief Удаляет из рабочего массива мертвые треугольники.
- */
-static void compact_alive_triangles(bw_triangle_t* triangles, size_t* count) {
-  size_t out = 0;
-  for (size_t i = 0; i < *count; i++) {
-    if (triangles[i].alive)
-      triangles[out++] = triangles[i];
-  }
-  *count = out;
-}
+#undef BW_GROW_INT
 
 /**
  * @brief Создает супер-треугольник, покрывающий все входные точки.
  */
-static int append_super_triangle(point_t* work_points, int n,
-                                 bw_triangle_t** triangles, size_t* count,
-                                 size_t* cap) {
+static int append_super_triangle(point_t* work_points, int n, bw_mesh_t* m) {
   double min_x = work_points[0].x, max_x = work_points[0].x;
   double min_y = work_points[0].y, max_y = work_points[0].y;
 
@@ -485,32 +748,33 @@ static int append_super_triangle(point_t* work_points, int n,
   double mid_y = (min_y + max_y) * 0.5;
   double pad = delta * 32.0;
 
-  work_points[n] = (point_t){ .x = (float)(mid_x - pad),
-                              .y = (float)(mid_y - pad),
-                              .z = 0.f, .height = 0.f, .id = -1 };
-  work_points[n + 1] = (point_t){ .x = (float)mid_x,
-                                  .y = (float)(mid_y + pad),
-                                  .z = 0.f, .height = 0.f, .id = -1 };
-  work_points[n + 2] = (point_t){ .x = (float)(mid_x + pad),
-                                  .y = (float)(mid_y - pad),
-                                  .z = 0.f, .height = 0.f, .id = -1 };
+  work_points[n] = (point_t){
+    .x = (float)(mid_x - pad), .y = (float)(mid_y - pad),
+    .z = 0.f, .height = 0.f, .id = -1
+  };
+  work_points[n + 1] = (point_t){
+    .x = (float)mid_x, .y = (float)(mid_y + pad),
+    .z = 0.f, .height = 0.f, .id = -1
+  };
+  work_points[n + 2] = (point_t){
+    .x = (float)(mid_x + pad), .y = (float)(mid_y - pad),
+    .z = 0.f, .height = 0.f, .id = -1
+  };
 
-  return append_bw_triangle(triangles, count, cap, work_points,
-                            n, n + 2, n + 1);
+  /* порядок (n, n+2, n+1) гарантированно против часовой стрелки */
+  return bw_new_triangle(m, work_points, n, n + 2, n + 1) >= 0;
 }
 
 /**
  * @brief Конвертирует рабочие треугольники в публичный формат.
  */
-static Triangle* collect_result_triangles(const bw_triangle_t* triangles,
-                                          size_t count, int point_count,
+static Triangle* collect_result_triangles(const bw_mesh_t* m, int point_count,
                                           int* num_triangles) {
   size_t out_count = 0;
-  for (size_t i = 0; i < count; i++) {
-    if (triangles[i].alive &&
-        triangles[i].p1 < point_count &&
-        triangles[i].p2 < point_count &&
-        triangles[i].p3 < point_count)
+  for (size_t i = 0; i < m->count; i++) {
+    const bw_triangle_t* t = &m->tris[i];
+    if (t->alive && t->p[0] < point_count && t->p[1] < point_count &&
+        t->p[2] < point_count)
       out_count++;
   }
 
@@ -526,18 +790,14 @@ static Triangle* collect_result_triangles(const bw_triangle_t* triangles,
   }
 
   size_t out_i = 0;
-  for (size_t i = 0; i < count; i++) {
-    if (!triangles[i].alive ||
-        triangles[i].p1 >= point_count ||
-        triangles[i].p2 >= point_count ||
-        triangles[i].p3 >= point_count)
+  for (size_t i = 0; i < m->count; i++) {
+    const bw_triangle_t* t = &m->tris[i];
+    if (!t->alive || t->p[0] >= point_count || t->p[1] >= point_count ||
+        t->p[2] >= point_count)
       continue;
 
     out[out_i++] = (Triangle){
-      .p1 = triangles[i].p1,
-      .p2 = triangles[i].p2,
-      .p3 = triangles[i].p3,
-      .numPolygon = 0
+      .p1 = t->p[0], .p2 = t->p[1], .p3 = t->p[2], .numPolygon = 0
     };
   }
 
@@ -547,95 +807,72 @@ static Triangle* collect_result_triangles(const bw_triangle_t* triangles,
 
 Triangle* delaunay_triangulation(point_t* points, int* num_points,
                                  int* num_triangles) {
+  /* Алгоритм Боуэра — Ватсона:
+   *  1. Нормализация точек (прореживание, удаление дубликатов,
+   *     упорядочивание вдоль кривой Гильберта).
+   *  2. Создание супер-треугольника.
+   *  3. Поочерёдная вставка точек: локализация каверны по смежности и её
+   *     локальная перестройка (без перебора всех треугольников).
+   *  4. Удаление супер-треугольника и возврат результата.
+   */
   if (num_triangles)
     *num_triangles = 0;
   if (!points || !num_points || !num_triangles || *num_points < 3)
     return NULL;
 
-  int n = normalize_points(points, *num_points);
-  *num_points = n;
-  if (n < 3) {
+  *num_points = normalize_points(points, *num_points);
+  if (*num_points < 3) {
     fprintf(stderr, "COUNT POINTS IS LOSS\n");
     return NULL;
   }
 
-  point_t* work_points = (point_t*)malloc((size_t)(n + 3) * sizeof(point_t));
+  /* все точки, включая вершины супертреугольника */
+  point_t* work_points =
+      (point_t*)malloc((size_t)(*num_points + 3) * sizeof(point_t));
   if (!work_points)
     return NULL;
-  memcpy(work_points, points, (size_t)n * sizeof(point_t));
+  memcpy(work_points, points, (size_t)*num_points * sizeof(point_t));
 
-  size_t tri_cap = 0;
-  size_t tri_count = 0;
-  bw_triangle_t* triangles = NULL;
-  if (!append_super_triangle(work_points, n, &triangles, &tri_count, &tri_cap)) {
+  bw_mesh_t mesh = { 0 };
+  if (!append_super_triangle(work_points, *num_points, &mesh)) {
+    free(mesh.tris);
+    free(mesh.freeList);
     free(work_points);
-    free(triangles);
     return NULL;
   }
 
-  unsigned char* bad = NULL;
-  size_t bad_cap = 0;
+  /* переиспользуемые между вставками рабочие буферы */
+  int *stackBuf = NULL, *touchedBuf = NULL, *newBuf = NULL;
+  int *bndA = NULL, *bndB = NULL, *bndOt = NULL, *bndOe = NULL;
+  size_t stackCap = 0, touchedCap = 0, newCap = 0, bndCap = 0;
+  int hint = 0; /* супертреугольник */
 
-  for (int p = 0; p < n; p++) {
-    if (tri_count > bad_cap) {
-      unsigned char* resized = (unsigned char*)realloc(bad, tri_count);
-      if (!resized) {
-        free(bad);
-        free(work_points);
-        free(triangles);
-        return NULL;
-      }
-      bad = resized;
-      bad_cap = tri_count;
+  int ok = 1;
+  for (int pidx = 0; pidx < *num_points; pidx++) {
+    if (!bw_insert_point(&mesh, work_points, pidx, &hint,
+                         &stackBuf, &stackCap, &touchedBuf, &touchedCap,
+                         &newBuf, &newCap, &bndA, &bndB, &bndOt, &bndOe,
+                         &bndCap)) {
+      ok = 0;
+      break;
     }
-
-    mark_bad_triangles(triangles, tri_count, work_points, &work_points[p], bad);
-
-    bw_edge_t* boundary = NULL;
-    size_t boundary_count = 0;
-    size_t boundary_cap = 0;
-
-    for (size_t t = 0; t < tri_count; t++) {
-      if (!bad[t])
-        continue;
-
-      if (!toggle_boundary_edge(&boundary, &boundary_count, &boundary_cap,
-                                triangles[t].p1, triangles[t].p2) ||
-          !toggle_boundary_edge(&boundary, &boundary_count, &boundary_cap,
-                                triangles[t].p2, triangles[t].p3) ||
-          !toggle_boundary_edge(&boundary, &boundary_count, &boundary_cap,
-                                triangles[t].p3, triangles[t].p1)) {
-        free(boundary);
-        free(bad);
-        free(work_points);
-        free(triangles);
-        return NULL;
-      }
-
-      triangles[t].alive = 0;
-    }
-
-    for (size_t e = 0; e < boundary_count; e++) {
-      if (!append_bw_triangle(&triangles, &tri_count, &tri_cap, work_points,
-                              boundary[e].a, boundary[e].b, p)) {
-        free(boundary);
-        free(bad);
-        free(work_points);
-        free(triangles);
-        return NULL;
-      }
-    }
-
-    free(boundary);
-    compact_alive_triangles(triangles, &tri_count);
   }
 
-  Triangle* result =
-      collect_result_triangles(triangles, tri_count, n, num_triangles);
+  free(stackBuf);
+  free(touchedBuf);
+  free(newBuf);
+  free(bndA);
+  free(bndB);
+  free(bndOt);
+  free(bndOe);
 
-  free(bad);
+  Triangle* result = NULL;
+  if (ok)
+    result = collect_result_triangles(&mesh, *num_points, num_triangles);
+
+  free(mesh.tris);
+  free(mesh.freeList);
   free(work_points);
-  free(triangles);
   return result;
 }
 
@@ -756,15 +993,25 @@ static void mark_good_triangles(Triangle* tri, size_t countTriangle,
 size_t triangulation_find_polygons(Triangle* tri, size_t countTriangle,
                                    const point_t* points, size_t countPoints,
                                    tri_correct_fn is_correct,
+                                   const unsigned char* precomputed,
                                    polygon_t** outPolys) {
   if (!outPolys) return 0;
   *outPolys = NULL;
-  if (!tri || countTriangle == 0 || !points || countPoints == 0 || !is_correct)
+  if (!tri || countTriangle == 0 || !points || countPoints == 0 ||
+      (!is_correct && !precomputed))
     return 0;
 
   unsigned char* good = (unsigned char*)malloc(countTriangle);
   if (!good) return 0;
-  mark_good_triangles(tri, countTriangle, points, is_correct, good);
+  if (precomputed) {
+    /* классификация уже выполнена внешним модулем (например, OpenCL) */
+    for (size_t i = 0; i < countTriangle; i++) {
+      tri[i].numPolygon = 0;
+      good[i] = precomputed[i] ? 1 : 0;
+    }
+  } else {
+    mark_good_triangles(tri, countTriangle, points, is_correct, good);
+  }
 
   int* neigh = (int*)malloc(countTriangle * 3 * sizeof(int));
   if (!neigh) {
@@ -799,10 +1046,13 @@ size_t triangulation_find_polygons(Triangle* tri, size_t countTriangle,
         idx = (idx + 1) & (cap - 1);
       }
       if (keys[idx] == 0ULL) {
+        /* Первое появление ребра — запоминаем его треугольник и номер ребра. */
         keys[idx] = k;
         valsTri[idx] = (int)ti;
         valsEdge[idx] = (signed char)e;
       } else {
+        /* Ребро уже встречалось у другого треугольника — связываем их как
+           соседей по этому общему ребру (взаимные ссылки смежности). */
         int ot = valsTri[idx];
         int oe = (int)valsEdge[idx];
         neigh[ti * 3 + e] = ot;

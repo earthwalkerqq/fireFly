@@ -1,7 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define GL_SILENCE_DEPRECATION 1
+#ifdef __APPLE__
+  #define GL_SILENCE_DEPRECATION
+  #define CL_SILENCE_DEPRECATION
+#endif
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -13,7 +16,14 @@
 #include "tlo.h"
 #include "shader.h"
 #include "triangulation.h"
+#include "opencl.h"
 
+/*
+ * Режим отображения
+ * 1 - цветное отображение тло (цвет зависит от величины удаления от рельефа) 
+ * 2 - серое отображение триангуляционной сетки
+ * 3 - триангуляционная сетка с подсвеченными безопасными зонами посадки
+*/
 extern char drawMode;
 
 #define DEBUG
@@ -21,16 +31,15 @@ extern char drawMode;
 #define WIN_WIDTH 1248
 #define WIN_HEIGHT 1024
 
-#ifndef FALSE
-#define FALSE 0
-#endif
-#ifndef TRUE
-#define TRUE 1
-#endif
+#define MIN_SIZE_TRIANGL 800
+#define MAX_SIZE_TRIANGL 40000
 
 vec3 cameraPos = {0.f, 0.f, 0.f};
 vec3 cameraFront = {0.f, 1.f, 0.f};  // направление взгляда (по оси Y)
 vec3 cameraUp = {0.f, 0.f, 1.f};     // направление вверх (ось Z)
+
+// запрос на пересборку триангуляции после изменения густоты сетки
+static int g_MeshRebuildRequest = 0;
 
 static float pitch = 0.f; // вертикальный поворот
 static float yaw = -90.f; // горизонтальный поворот
@@ -77,13 +86,36 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
     float currentSpeed = 20 * cameraSpeed * deltaTime;
 
     if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) {
-      drawMode = 1; // облако точек
+      drawMode = 1;
     }
     if (glfwGetKey(window, GLFW_KEY_2) == GLFW_PRESS) {
-      drawMode = 2; // серая триангуляционная сетка
+      drawMode = 2;
     }
     if (glfwGetKey(window, GLFW_KEY_3) == GLFW_PRESS) {
-      drawMode = 3; // сетка с безопасными зонами по рангу
+      drawMode = 3;
+    }
+
+    // [ — сделать сетку реже. Клавиши блокируются, пока идёт пересборка.
+    if (glfwGetKey(window, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS &&
+        !g_MeshRebuildRequest && !tloRebuildInProgress()) {
+      int d = (int)(triangulation_get_max_points() / 1.5);
+      if (d < MIN_SIZE_TRIANGL) d = MIN_SIZE_TRIANGL;
+      triangulation_set_max_points(d);
+      g_MeshRebuildRequest = 1;
+      #ifdef DEBUG
+      printf("Густота триангуляции: предел точек = %d\n", d);
+      #endif
+    }
+    // ] — сделать сетку гуще.
+    if (glfwGetKey(window, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS &&
+        !g_MeshRebuildRequest && !tloRebuildInProgress()) {
+      int d = (int)(triangulation_get_max_points() * 1.5);
+      if (d > MAX_SIZE_TRIANGL) d = MAX_SIZE_TRIANGL;
+      triangulation_set_max_points(d);
+      g_MeshRebuildRequest = 1;
+      #ifdef DEBUG
+      printf("Густота триангуляции: предел точек = %d\n", d);
+      #endif
     }
 
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
@@ -119,12 +151,11 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
         glm_vec3_scale(cameraUp, currentSpeed, resMul);
         glm_vec3_add(cameraPos, resMul, cameraPos);
     }
-    // if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-    //     glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
-    //     vec3 resMul;
-    //     glm_vec3_scale(cameraUp, currentSpeed, resMul);
-    //     glm_vec3_sub(cameraPos, resMul, cameraPos);
-    // }
+    if (glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+        vec3 resMul;
+        glm_vec3_scale(cameraUp, currentSpeed, resMul);
+        glm_vec3_sub(cameraPos, resMul, cameraPos);
+    }
     if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
       yaw += 0.5f;
     }
@@ -148,9 +179,9 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
     // вычисляем направление взгляда
     // горизонталь: плоскость X-Y, высота: Z
     vec3 front;
-    front[0] = cosf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // X
-    front[1] = sinf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // Y
-    front[2] = sinf(glm_rad(pitch));                      // Z
+    front[0] = cosf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // x
+    front[1] = sinf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // y
+    front[2] = sinf(glm_rad(pitch));                      // z
     glm_vec3_normalize_to(front, cameraFront);
 }
 
@@ -164,6 +195,7 @@ void mouseCallback(GLFWwindow* window, int button, int action, int __attribute__
 }
 
 void mainloop(GLFWwindow* window, TloRender* tlo, GLuint shaderProg) {
+  // fps
   float lastFrame = glfwGetTime();
   float deltaFrame;
   while (!glfwWindowShouldClose(window)) {
@@ -172,6 +204,14 @@ void mainloop(GLFWwindow* window, TloRender* tlo, GLuint shaderProg) {
     lastFrame = curFrame;
 
     keyCallback(window, deltaFrame);
+
+    // запуск фоновой пересборки сетки при изменении её густоты
+    if (g_MeshRebuildRequest) {
+      g_MeshRebuildRequest = 0;
+      rebuildTloTriangulation(tlo);
+    }
+    // проверка готовности фоновой пересборки и загрузка результата в GPU
+    pollTloRebuild(tlo);
 
     glClearColor(0.2f, 0.2f, 0.2f, 1.f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -209,6 +249,11 @@ void mainloop(GLFWwindow* window, TloRender* tlo, GLuint shaderProg) {
 }
 
 int main(int argc, char** argv) {
+#ifndef USE_OPENCL
+  printf("[opencl] OpenCL неподключено\n");
+#else
+  printf("[opencl] OpenCL подключено\n");
+#endif
   const char *pathData = (argc > 1) ? argv[1] : PATH_DATA;
 
   GLFWwindow* window = _glfwGetWindow(WIN_WIDTH, WIN_HEIGHT);
@@ -223,6 +268,20 @@ int main(int argc, char** argv) {
   }
 
   _glSetup();
+
+  // инициализация гетерогенной вычислительной системы OpenCL.
+  // При недоступности OpenCL расчёты выполняются на CPU через pthread.
+  // На OpenCL вынесена классификация треугольников — единый массовый
+  // проход по всем треугольникам уже построенной сетки (предикат
+  // безопасности независим для каждого треугольника, что идеально
+  // ложится на data-parallel модель GPU). Само построение триангуляции
+  // остаётся на CPU: вставка точки затрагивает лишь небольшую локальную
+  // каверну, поэтому выгрузка на GPU на каждом шаге невыгодна.
+  if (openclInit()) {
+    openclPrintDevice();
+  } else {
+    printf("[opencl] OpenCL недоступно — расчёт выполняется на CPU\n");
+  }
 
   int heights[RZP_MATRIX_SIZE];
   if (!getRZPMtrx(PATH_DATA, RZP_TILES[0], heights)) { // пока есть ед-ый файл с rzp
@@ -280,5 +339,6 @@ int main(int argc, char** argv) {
   mainloop(window, &tlo, shaderProg);
 
   freeTlo(&tlo);
+  openclShutdown();
   return 0;
 }

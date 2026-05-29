@@ -94,15 +94,24 @@ size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
   double *bbMaxX = (double *)malloc(naccum * sizeof(double));
   double *bbMinY = (double *)malloc(naccum * sizeof(double));
   double *bbMaxY = (double *)malloc(naccum * sizeof(double));
+  /* Лучший по удалённости от границ треугольник внутри зоны —
+     его центроид становится «центром» круглой посадочной области. */
+  double *bestClr = (double *)calloc(naccum, sizeof(double));
+  double *bestCx  = (double *)calloc(naccum, sizeof(double));
+  double *bestCy  = (double *)calloc(naccum, sizeof(double));
+  double *bestCz  = (double *)calloc(naccum, sizeof(double));
   if (!cnt || !areaS || !slpS || !slpMax || !clrS ||
-      !bbMinX || !bbMaxX || !bbMinY || !bbMaxY) {
+      !bbMinX || !bbMaxX || !bbMinY || !bbMaxY ||
+      !bestClr || !bestCx || !bestCy || !bestCz) {
     free(cnt); free(areaS); free(slpS); free(slpMax); free(clrS);
     free(bbMinX); free(bbMaxX); free(bbMinY); free(bbMaxY);
+    free(bestClr); free(bestCx); free(bestCy); free(bestCz);
     return 0;
   }
   for (size_t i = 0; i < naccum; i++) {
     bbMinX[i] = bbMinY[i] =  1e300;
     bbMaxX[i] = bbMaxY[i] = -1e300;
+    bestClr[i] = -1.0; /* < 0 — значит ещё не назначен */
   }
 
   /* Накопление характеристик по безопасным треугольникам. */
@@ -128,6 +137,18 @@ size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
       if (x > bbMaxX[pid]) bbMaxX[pid] = x;
       if (y < bbMinY[pid]) bbMinY[pid] = y;
       if (y > bbMaxY[pid]) bbMaxY[pid] = y;
+    }
+
+    /* Запоминаем центроид треугольника, наиболее удалённого от границ
+       связной области — это и есть кандидат на центр посадочного круга. */
+    if (clr > bestClr[pid]) {
+      const point_t *a = &pts[idx[0]];
+      const point_t *b = &pts[idx[1]];
+      const point_t *c = &pts[idx[2]];
+      bestClr[pid] = clr;
+      bestCx[pid]  = ((double)a->x + b->x + c->x) / 3.0;
+      bestCy[pid]  = ((double)a->y + b->y + c->y) / 3.0;
+      bestCz[pid]  = ((double)a->z + b->z + c->z) / 3.0;
     }
   }
 
@@ -171,11 +192,16 @@ size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
     zones[z].compactness = comp;
     zones[z].clearance   = clrS[pid] / (double)cnt[pid];
     zones[z].score       = 0.0;
+    zones[z].cx          = bestCx[pid];
+    zones[z].cy          = bestCy[pid];
+    zones[z].cz          = bestCz[pid];
+    zones[z].maxInscribed = (bestClr[pid] > 0.0) ? bestClr[pid] : 0.0;
     z++;
   }
 
   free(cnt); free(areaS); free(slpS); free(slpMax); free(clrS);
   free(bbMinX); free(bbMaxX); free(bbMinY); free(bbMaxY);
+  free(bestClr); free(bestCx); free(bestCy); free(bestCz);
 
   /* Диапазоны частных критериев для нормировки. */
   double aLo  = zones[0].area,        aHi  = zones[0].area;
@@ -223,10 +249,15 @@ size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
       for (unsigned p = 0; p <= maxPid; p++) pidRank[p] = -1;
       for (size_t i = 0; i < numZones; i++)
         pidRank[zones[i].pid] = zones[i].rank;
+      /* Ранг (а значит и заливку) получает ВСЯ связная корректная область
+         зоны, прошедшей отбор (pidRank>=0, т.е. в ней помещается хотя бы один
+         посадочный круг ЛА), а не только эрозированное ядро безопасных
+         треугольников. Так заливка совпадает с подсвеченной зоной, а
+         окружность лишь отмечает конкретное место под аппарат. */
       for (size_t ti = 0; ti < countTri; ti++) {
-        if (!triIsSafe[ti]) continue;
         unsigned pid = tri[ti].numPolygon;
-        if (pid >= 1 && pid <= maxPid) triRank[ti] = pidRank[pid];
+        if (pid >= 1 && pid <= maxPid && pidRank[pid] >= 0)
+          triRank[ti] = pidRank[pid];
       }
       free(pidRank);
     }

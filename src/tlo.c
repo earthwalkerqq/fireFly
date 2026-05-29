@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <cglm/cglm.h>
 
 #include "tlo.h"
@@ -14,19 +15,24 @@
 #include "rzp.h"
 #include "triangulation.h"
 #include "findSafe.h"
+#include "opencl.h"
 
 #define BLOCK_SIZE (3 * sizeof(double))
 #define COUNT_TLO_ATTR 4 // x, y, z, height
 
 #define TRIANGLE_ATTR COUNT_TLO_ATTR * 3
 
-#define RADIUS_LA 18.
+#define RADIUS_LA 15.
 
 // draw mode
 #define POINT_MODE 1
 #define TRIANGLE_MODE 2
 #define ZONE_MODE 3
 
+// для пересборки триангуляционной сетки
+#define REBUILD_IDLE    0
+#define REBUILD_RUNNING 1
+#define REBUILD_READY   2
 
 FrgIndex TLO_TILES[128];
 
@@ -124,89 +130,55 @@ static void buildTloPoints(TloRender *tlo, point_t* vrt) {
   glBindVertexArray(0);
 }
 
-// Загружает в GPU вершины и индексы всей триангуляционной сетки.
-static void buildTloTriangles(TloRender *tlo, Triangle* tri, point_t* triVerts,
-                              int numTriVerts) {
-  if (!tlo->vao_tri || !tlo->ebo || !tlo->vbo_tri)
-    return;
+/*
+ * Результат вычисления триангуляции — данные, готовые к загрузке в GPU.
+ * Формируется на CPU (в т. ч. в фоновом потоке), не содержит вызовов GL,
+ * поэтому может вычисляться вне главного потока. Загрузку в видеопамять
+ * выполняет uploadTriang() уже в главном потоке.
+ */
+typedef struct {
+  point_t*  meshVerts;     // вершины триангуляционной сетки
+  int       meshVertCount;
+  unsigned* meshIndices;   // индексы треугольников, по 3 на треугольник
+  int       triCount;
+  point_t*  zoneVerts;     // вершины безопасных зон (ранг в поле height)
+  int       zoneVertCount;
+  point_t*  circleVerts;   // вершины окружностей-маркеров посадочных кругов
+  int       circleVertCount;
+  int       ok;            // 1 — результат корректен
+} TriangResult;
 
-  glBindVertexArray(tlo->vao_tri);
-
-  glBindBuffer(GL_ARRAY_BUFFER, tlo->vbo_tri);
-  glBufferData(GL_ARRAY_BUFFER, (size_t)numTriVerts * sizeof(point_t),
-               triVerts, GL_STATIC_DRAW);
-
-  size_t idxSize = (size_t)tlo->countTriangles * 3 * sizeof(unsigned);
-  unsigned *indices = (unsigned*)malloc(idxSize);
-  if (!indices)
-    return;
-
-  for (int i = 0; i < tlo->countTriangles; i++) {
-    int a = tri[i].p1, b = tri[i].p2, c = tri[i].p3;
-    float ax = triVerts[a].x, ay = triVerts[a].y;
-    float bx = triVerts[b].x, by = triVerts[b].y;
-    float cx = triVerts[c].x, cy = triVerts[c].y;
-    // обеспечиваем положительную ориентацию
-    float area2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
-    if (area2 < 0) { int t = b; b = c; c = t; }
-    indices[i * 3]     = (unsigned)a;
-    indices[i * 3 + 1] = (unsigned)b;
-    indices[i * 3 + 2] = (unsigned)c;
-  }
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, tlo->ebo);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)idxSize, indices, GL_STATIC_DRAW);
-  free(indices);
-
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
-                        sizeof(point_t), (void *)0);
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE,
-                        sizeof(point_t),
-                        (void *)offsetof(point_t, height));
-  glEnableVertexAttribArray(1);
-
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glBindVertexArray(0);
+static void freeTriangResult(TriangResult* r) {
+  if (!r) return;
+  free(r->meshVerts);
+  free(r->meshIndices);
+  free(r->zoneVerts);
+  free(r->circleVerts);
+  r->meshVerts = NULL;
+  r->meshIndices = NULL;
+  r->zoneVerts = NULL;
+  r->circleVerts = NULL;
+  r->meshVertCount = r->triCount = r->zoneVertCount = r->circleVertCount = 0;
+  r->ok = 0;
 }
 
-// Загружает в GPU геометрию безопасных зон. Каждый безопасный треугольник
-// представлен тремя вершинами, в поле height которых записан нормированный
-// ранг зоны (0.0 — лучшая зона, 1.0 — худшая) для окраски в шейдере.
-static void buildTloZones(TloRender *tlo, const Triangle* tri,
-                          const point_t* triVerts, const int* triRank,
-                          size_t numZones) {
-  tlo->countZoneVerts = 0;
-  if (!tlo->vao_zone || !tlo->vbo_zone || !triRank)
+// Загружает готовый результат триангуляции в видеопамять.
+// Только вызовы OpenGL — выполняется строго в главном потоке.
+static void uploadTriang(TloRender* tlo, const TriangResult* res) {
+  if (!res->ok || !tlo->vao_tri || !tlo->ebo || !tlo->vbo_tri)
     return;
 
-  size_t safeCount = 0;
-  for (int i = 0; i < tlo->countTriangles; i++)
-    if (triRank[i] >= 0) safeCount++;
-  if (safeCount == 0)
-    return;
+  tlo->countTriangles = (GLsizei)res->triCount;
 
-  point_t* verts = (point_t*)malloc(safeCount * 3 * sizeof(point_t));
-  if (!verts)
-    return;
-
-  double denom = (numZones > 1) ? (double)(numZones - 1) : 1.0;
-  size_t v = 0;
-  for (int i = 0; i < tlo->countTriangles; i++) {
-    if (triRank[i] < 0) continue;
-    float rankNorm = (numZones > 1) ? (float)(triRank[i] / denom) : 0.0f;
-    int idx[3] = { tri[i].p1, tri[i].p2, tri[i].p3 };
-    for (int k = 0; k < 3; k++) {
-      verts[v] = triVerts[idx[k]];
-      verts[v].height = rankNorm; // поле height переиспользовано под ранг
-      v++;
-    }
-  }
-
-  glBindVertexArray(tlo->vao_zone);
-  glBindBuffer(GL_ARRAY_BUFFER, tlo->vbo_zone);
-  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v * sizeof(point_t)),
-               verts, GL_STATIC_DRAW);
+  glBindVertexArray(tlo->vao_tri);
+  glBindBuffer(GL_ARRAY_BUFFER, tlo->vbo_tri);
+  glBufferData(GL_ARRAY_BUFFER,
+               (GLsizeiptr)((size_t)res->meshVertCount * sizeof(point_t)),
+               res->meshVerts, GL_STATIC_DRAW);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, tlo->ebo);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+               (GLsizeiptr)((size_t)res->triCount * 3 * sizeof(unsigned)),
+               res->meshIndices, GL_STATIC_DRAW);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
                         sizeof(point_t), (void *)0);
   glEnableVertexAttribArray(0);
@@ -216,9 +188,44 @@ static void buildTloZones(TloRender *tlo, const Triangle* tri,
   glEnableVertexAttribArray(1);
   glBindBuffer(GL_ARRAY_BUFFER, 0);
   glBindVertexArray(0);
-  free(verts);
 
-  tlo->countZoneVerts = (GLsizei)v;
+  tlo->countZoneVerts = (GLsizei)res->zoneVertCount;
+  if (res->zoneVertCount > 0 && res->zoneVerts &&
+      tlo->vao_zone && tlo->vbo_zone) {
+    glBindVertexArray(tlo->vao_zone);
+    glBindBuffer(GL_ARRAY_BUFFER, tlo->vbo_zone);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)((size_t)res->zoneVertCount * sizeof(point_t)),
+                 res->zoneVerts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(point_t), (void *)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE,
+                          sizeof(point_t),
+                          (void *)offsetof(point_t, height));
+    glEnableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+  }
+
+  tlo->countCircleVerts = (GLsizei)res->circleVertCount;
+  if (res->circleVertCount > 0 && res->circleVerts &&
+      tlo->vao_circles && tlo->vbo_circles) {
+    glBindVertexArray(tlo->vao_circles);
+    glBindBuffer(GL_ARRAY_BUFFER, tlo->vbo_circles);
+    glBufferData(GL_ARRAY_BUFFER,
+                 (GLsizeiptr)((size_t)res->circleVertCount * sizeof(point_t)),
+                 res->circleVerts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE,
+                          sizeof(point_t), (void *)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE,
+                          sizeof(point_t),
+                          (void *)offsetof(point_t, height));
+    glEnableVertexAttribArray(1);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+  }
 }
 
 static double dist2_xy(const point_t* a, const point_t* b) {
@@ -392,7 +399,14 @@ static int isCorrectTriangle_local(const Triangle* tri, const point_t* points) {
   if (d2_23 < minD2) minD2 = d2_23;
   if (d2_31 < minD2) minD2 = d2_31;
   if (minD2 <= 0.0) return 0;
-  return ((maxH - minH) / sqrt(minD2) < ANGLE_SLOPE) ? 1 : 0;
+
+  // Перепад высот в пределах шума измерений: треугольник считается ровным
+  // независимо от размера. Без этого мелкие треугольники густой сетки
+  // ложно отбраковываются по уклону из-за шума данных.
+  double dz = maxH - minH;
+  if (dz <= Z_FLAT_TOLERANCE) return 1;
+
+  return (dz / sqrt(minD2) < ANGLE_SLOPE) ? 1 : 0;
 }
 
 static char varifyTloData(const char* path, size_t* sizeTlo, int* countTlo) {
@@ -431,40 +445,56 @@ static char varifyTloData(const char* path, size_t* sizeTlo, int* countTlo) {
   return 1;
 }
 
-static char triangTlo(TloRender *tlo, point_t* vrt, int countPoints) {
-  int countTriangles = 0;
+/*
+ * Вычисление триангуляции (этап CPU, без вызовов OpenGL).
+ * Строит триангуляцию Делоне, классифицирует треугольники, выделяет и
+ * ранжирует безопасные зоны и формирует массивы вершин и индексов,
+ * готовые к загрузке в видеопамять. Не обращается к структуре TloRender
+ * и к OpenGL, поэтому может выполняться в фоновом потоке.
+ */
+static int computeTriang(const point_t* cloud, int cloudCount,
+                         TriangResult* res) {
+  memset(res, 0, sizeof(*res));
+  if (!cloud || cloudCount < 3)
+    return 0;
 
+  int countPoints = cloudCount;
   point_t* triPoints = (point_t*)malloc((size_t)countPoints * sizeof(point_t));
   if (!triPoints) {
     fprintf(stderr, "FAILED FROM MEMORY ALLOCATE (triPoints)\n");
     return 0;
   }
+  memcpy(triPoints, cloud, (size_t)countPoints * sizeof(point_t));
 
-  memcpy(triPoints, vrt, (size_t)countPoints * sizeof(point_t));
-
-  Triangle *triangles =
+  int countTriangles = 0;
+  Triangle* triangles =
       delaunay_triangulation(triPoints, &countPoints, &countTriangles);
-
   if (!triangles || countTriangles <= 0) {
-    fprintf(stderr, "TRIANGULATION FAILED (COUNT=%d), POINTS ONLY\n", countTriangles);
-    memDestroy(2, (void*)triangles, (void*)triPoints);
-    tlo->countTriangles = 0;
+    fprintf(stderr, "TRIANGULATION FAILED (COUNT=%d)\n", countTriangles);
+    free(triangles);
+    free(triPoints);
     return 0;
   }
 
-  tlo->countTriangles = (GLsizei)countTriangles;
+  // классификация треугольников (на OpenCL-устройстве либо на CPU)
+  unsigned char* clsBuf = (unsigned char*)malloc((size_t)countTriangles);
+  const unsigned char* precomputed = NULL;
+  if (clsBuf &&
+      openclClassifyTriangles(triangles, (size_t)countTriangles,
+                              triPoints, (size_t)countPoints,
+                              MAX_HEIGTH, ANGLE_SLOPE, Z_FLAT_TOLERANCE,
+                              clsBuf))
+    precomputed = clsBuf;
 
-  // 1) связные области корректных треугольников и их контуры
+  // связные области корректных треугольников и их контуры
   polygon_t* polys = NULL;
-  size_t polyCount = triangulation_find_polygons(triangles, (size_t)countTriangles,
-                                                 triPoints, (size_t)countPoints,
-                                                 isCorrectTriangle_local,
-                                                 &polys);
+  size_t polyCount = triangulation_find_polygons(
+      triangles, (size_t)countTriangles, triPoints, (size_t)countPoints,
+      isCorrectTriangle_local, precomputed, &polys);
+  free(clsBuf);
 
-  // 2) безопасные треугольники: весь треугольник не ближе R к опасному контуру.
-  //    triClearance хранит фактическое удаление треугольника от границ.
-  const double aircraftR = RADIUS_LA;
-  const double aircraftR2 = aircraftR * aircraftR;
+  // безопасные треугольники и их удаление от опасных границ
+  const double aircraftR2 = RADIUS_LA * RADIUS_LA;
   unsigned maxPid = 0;
   for (int i = 0; i < countTriangles; i++)
     if (triangles[i].numPolygon > maxPid) maxPid = triangles[i].numPolygon;
@@ -473,55 +503,233 @@ static char triangTlo(TloRender *tlo, point_t* vrt, int countPoints) {
       (unsigned char*)calloc((size_t)countTriangles, 1);
   double* triClearance =
       (double*)calloc((size_t)countTriangles, sizeof(double));
-
+  size_t dbgCorrectTri = 0, dbgSafeTri = 0;
+  double dbgMaxClr = 0.0;
   if (triIsSafe && triClearance && polyCount > 0 && maxPid > 0) {
     for (int ti = 0; ti < countTriangles; ti++) {
       unsigned pid = triangles[ti].numPolygon;
       if (pid == 0 || pid > maxPid) continue;
-
-      double minD2 = min_dist2_triangle_to_contours(&triangles[ti], triPoints,
-                                                    (size_t)countPoints,
-                                                    polys, polyCount,
-                                                    pid, aircraftR2);
+      dbgCorrectTri++;
+      double minD2 = min_dist2_triangle_to_contours(
+          &triangles[ti], triPoints, (size_t)countPoints,
+          polys, polyCount, pid, aircraftR2);
       triClearance[ti] = sqrt(minD2);
-      if (minD2 >= aircraftR2)
+      if (triClearance[ti] > dbgMaxClr) dbgMaxClr = triClearance[ti];
+      if (minD2 >= aircraftR2) {
         triIsSafe[ti] = 1;
+        dbgSafeTri++;
+      }
     }
   }
 
-  // 3) геометрия всей триангуляционной сетки
-  buildTloTriangles(tlo, triangles, triPoints, countPoints);
+  // индексы треугольников сетки (с правкой ориентации обхода)
+  unsigned* indices =
+      (unsigned*)malloc((size_t)countTriangles * 3 * sizeof(unsigned));
+  if (indices) {
+    for (int i = 0; i < countTriangles; i++) {
+      int a = triangles[i].p1, b = triangles[i].p2, c = triangles[i].p3;
+      float ax = triPoints[a].x, ay = triPoints[a].y;
+      float bx = triPoints[b].x, by = triPoints[b].y;
+      float cx = triPoints[c].x, cy = triPoints[c].y;
+      float area2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+      if (area2 < 0) { int t = b; b = c; c = t; }
+      indices[i * 3]     = (unsigned)a;
+      indices[i * 3 + 1] = (unsigned)b;
+      indices[i * 3 + 2] = (unsigned)c;
+    }
+  }
 
-  // 4) ранжирование безопасных зон и построение их геометрии
+  // ранжирование безопасных зон и вершины зон (ранг — в поле height)
   SafeZone* zones = NULL;
   int* triRank = (int*)malloc((size_t)countTriangles * sizeof(int));
   size_t numZones = 0;
+  point_t* zoneVerts = NULL;
+  int zoneVertCount = 0;
   if (triRank && triIsSafe) {
     numZones = rankSafeZones(triangles, (size_t)countTriangles, triPoints,
                              triIsSafe, triClearance, maxPid,
                              zoneWeightsDefault(), &zones, triRank);
-    buildTloZones(tlo, triangles, triPoints, triRank, numZones);
+    size_t safeCount = 0;
+    for (int i = 0; i < countTriangles; i++)
+      if (triRank[i] >= 0) safeCount++;
+    if (safeCount > 0) {
+      zoneVerts = (point_t*)malloc(safeCount * 3 * sizeof(point_t));
+      if (zoneVerts) {
+        double denom = (numZones > 1) ? (double)(numZones - 1) : 1.0;
+        size_t v = 0;
+        for (int i = 0; i < countTriangles; i++) {
+          if (triRank[i] < 0) continue;
+          float rankNorm =
+              (numZones > 1) ? (float)(triRank[i] / denom) : 0.0f;
+          int idx[3] = { triangles[i].p1, triangles[i].p2, triangles[i].p3 };
+          for (int k = 0; k < 3; k++) {
+            zoneVerts[v] = triPoints[idx[k]];
+            zoneVerts[v].height = rankNorm;
+            v++;
+          }
+        }
+        zoneVertCount = (int)v;
+      }
+    }
   }
 
-#ifdef DEBUG
-  printf("[zones] points=%d tris=%d polys=%zu safeZones=%zu\n",
-         countPoints, countTriangles, polyCount, numZones);
-  for (size_t i = 0; i < numZones; i++) {
-    printf("  rank %d: pid=%u score=%.3f area=%.1f meanSlope=%.3f "
-           "maxSlope=%.3f compact=%.2f clearance=%.1f tris=%zu\n",
-           zones[i].rank, zones[i].pid, zones[i].score, zones[i].area,
-           zones[i].meanSlope, zones[i].maxSlope, zones[i].compactness,
-           zones[i].clearance, zones[i].triCount);
+  /* Вершины окружностей-маркеров: для каждой зоны окружность радиуса
+     RADIUS_LA с центром в (zone.cx, zone.cy, zone.cz). Окружность
+     выводится как набор отрезков GL_LINES: 64 сегмента × 2 вершины. */
+  const int CIRCLE_SEG = 64;
+  point_t* circleVerts = NULL;
+  int circleVertCount = 0;
+  if (zones && numZones > 0) {
+    circleVerts =
+        (point_t*)malloc((size_t)numZones * CIRCLE_SEG * 2 * sizeof(point_t));
+    if (circleVerts) {
+      double denomC = (numZones > 1) ? (double)(numZones - 1) : 1.0;
+      const double dTheta = 2.0 * M_PI / CIRCLE_SEG;
+      const double Z_BIAS = 0.6; /* небольшой подъём, чтобы не сливалось с заливкой */
+      for (size_t zi = 0; zi < numZones; zi++) {
+        float rankNorm =
+            (numZones > 1) ? (float)(zones[zi].rank / denomC) : 0.0f;
+        double cx = zones[zi].cx;
+        double cy = zones[zi].cy;
+        double cz = zones[zi].cz + Z_BIAS;
+        for (int s = 0; s < CIRCLE_SEG; s++) {
+          double a1 = (double)s * dTheta;
+          double a2 = (double)((s + 1) % CIRCLE_SEG) * dTheta;
+          point_t v1 = {
+            .x = (float)(cx + RADIUS_LA * cos(a1)),
+            .y = (float)(cy + RADIUS_LA * sin(a1)),
+            .z = (float)cz,
+            .height = rankNorm,
+            .id = 0
+          };
+          point_t v2 = {
+            .x = (float)(cx + RADIUS_LA * cos(a2)),
+            .y = (float)(cy + RADIUS_LA * sin(a2)),
+            .z = (float)cz,
+            .height = rankNorm,
+            .id = 0
+          };
+          circleVerts[circleVertCount++] = v1;
+          circleVerts[circleVertCount++] = v2;
+        }
+      }
+    }
   }
-#endif
+
+  printf("[zones] points=%d tris=%d polys=%zu correctTri=%zu maxPid=%u "
+         "clrLimit=%.1f maxClr=%.2f safeTri=%zu safeZones=%zu zoneVerts=%d circles=%d\n",
+         countPoints, countTriangles, polyCount, dbgCorrectTri, maxPid,
+         (double)RADIUS_LA, dbgMaxClr, dbgSafeTri, numZones,
+         zoneVertCount, circleVertCount / (2 * CIRCLE_SEG));
 
   triangulation_free_polygons(polys, polyCount);
   free(zones);
   free(triRank);
   memDestroy(2, (void*)triIsSafe, (void*)triClearance);
-  memDestroy(2, (void*)triangles, (void*)triPoints);
+  free(triangles);
 
+  if (!indices) {
+    free(triPoints);
+    free(zoneVerts);
+    free(circleVerts);
+    return 0;
+  }
+
+  res->meshVerts       = triPoints;       // владение передаётся результату
+  res->meshVertCount   = countPoints;
+  res->meshIndices     = indices;
+  res->triCount        = countTriangles;
+  res->zoneVerts       = zoneVerts;
+  res->zoneVertCount   = zoneVertCount;
+  res->circleVerts     = circleVerts;
+  res->circleVertCount = circleVertCount;
+  res->ok = 1;
   return 1;
+}
+
+// Синхронная триангуляция: вычисление + загрузка в GPU (главный поток).
+static char triangTlo(TloRender* tlo, point_t* vrt, int countPoints) {
+  TriangResult res;
+  if (!computeTriang(vrt, countPoints, &res)) {
+    tlo->countTriangles = 0;
+    return 0;
+  }
+  uploadTriang(tlo, &res);
+  freeTriangResult(&res);
+  return 1;
+}
+
+static struct {
+  pthread_t      thread;
+  int            state;       // под защитой g_rebuildLock
+  int            hasThread;   // поток создан и ещё не присоединён
+  const point_t* cloud;       // вход (указывает на TloRender.cloud)
+  int            cloudCount;
+  TriangResult   result;      // выход фонового потока
+} g_rebuild = { .state = REBUILD_IDLE, .hasThread = 0 };
+
+static pthread_mutex_t g_rebuildLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Тело фонового потока: тяжёлое вычисление триангуляции без вызовов GL.
+static void* rebuildWorker(void* arg) {
+  (void)arg;
+  computeTriang(g_rebuild.cloud, g_rebuild.cloudCount, &g_rebuild.result);
+  pthread_mutex_lock(&g_rebuildLock);
+  g_rebuild.state = REBUILD_READY;
+  pthread_mutex_unlock(&g_rebuildLock);
+  return NULL;
+}
+
+int tloRebuildInProgress(void) {
+  pthread_mutex_lock(&g_rebuildLock);
+  int busy = (g_rebuild.state != REBUILD_IDLE);
+  pthread_mutex_unlock(&g_rebuildLock);
+  return busy;
+}
+
+char rebuildTloTriangulation(TloRender* tlo) {
+  if (!tlo || !tlo->is_loaded || !tlo->cloud || tlo->cloudCount < 3)
+    return 0;
+
+  pthread_mutex_lock(&g_rebuildLock);
+  if (g_rebuild.state != REBUILD_IDLE) {
+    pthread_mutex_unlock(&g_rebuildLock);
+    return 0;  // пересборка уже выполняется
+  }
+  g_rebuild.cloud = tlo->cloud;
+  g_rebuild.cloudCount = tlo->cloudCount;
+  g_rebuild.state = REBUILD_RUNNING;
+  pthread_mutex_unlock(&g_rebuildLock);
+
+  if (pthread_create(&g_rebuild.thread, NULL, rebuildWorker, NULL) != 0) {
+    // поток создать не удалось — выполняем синхронно
+    pthread_mutex_lock(&g_rebuildLock);
+    g_rebuild.state = REBUILD_IDLE;
+    pthread_mutex_unlock(&g_rebuildLock);
+    return triangTlo(tlo, tlo->cloud, tlo->cloudCount);
+  }
+  g_rebuild.hasThread = 1;
+  return 1;
+}
+
+void pollTloRebuild(TloRender* tlo) {
+  pthread_mutex_lock(&g_rebuildLock);
+  int st = g_rebuild.state;
+  pthread_mutex_unlock(&g_rebuildLock);
+  if (st != REBUILD_READY)
+    return;
+
+  if (g_rebuild.hasThread) {
+    pthread_join(g_rebuild.thread, NULL);
+    g_rebuild.hasThread = 0;
+  }
+  if (g_rebuild.result.ok)
+    uploadTriang(tlo, &g_rebuild.result);  // загрузка в GPU — главный поток
+  freeTriangResult(&g_rebuild.result);
+
+  pthread_mutex_lock(&g_rebuildLock);
+  g_rebuild.state = REBUILD_IDLE;
+  pthread_mutex_unlock(&g_rebuildLock);
 }
 
 char initTlo(TloRender* tlo, const char* path, size_t* sizeTlo, int* countTlo) {
@@ -530,13 +738,18 @@ char initTlo(TloRender* tlo, const char* path, size_t* sizeTlo, int* countTlo) {
   glGenVertexArrays(1, &tlo->vao_points);
   glGenVertexArrays(1, &tlo->vao_tri);
   glGenVertexArrays(1, &tlo->vao_zone);
+  glGenVertexArrays(1, &tlo->vao_circles);
 
   glGenBuffers(1, &tlo->vbo_points);
   glGenBuffers(1, &tlo->vbo_tri);
   glGenBuffers(1, &tlo->ebo);
   glGenBuffers(1, &tlo->vbo_zone);
+  glGenBuffers(1, &tlo->vbo_circles);
 
   tlo->totalPoints = tlo->countTriangles = tlo->countZoneVerts = 0;
+  tlo->countCircleVerts = 0;
+  tlo->cloud = NULL;
+  tlo->cloudCount = 0;
   tlo->is_loaded = 0;
   return 1;
 }
@@ -598,15 +811,21 @@ char loadAllTloData(TloRender* tlo, const char* path, size_t sizeTlo, int countT
 
   buildTloPoints(tlo, vrt);
 
-  if (!triangTlo(tlo, vrt, tlo->totalPoints)) {
+  // облако точек сохраняется в TloRender для пересборки триангуляции
+  // с другой густотой сетки; triangTlo копирует данные и не изменяет vrt
+  tlo->cloud = vrt;
+  tlo->cloudCount = (int)fragNumber;
+  tlo->is_loaded = 1;
+
+  if (!triangTlo(tlo, tlo->cloud, tlo->cloudCount)) {
     free(vrt);
+    tlo->cloud = NULL;
+    tlo->cloudCount = 0;
+    tlo->is_loaded = 0;
     return 0;
   }
 
-  free(vrt);
-  tlo->is_loaded = 1;
-
-  printf("avg count poinst = %d\n", tlo->totalPoints / countTlo);
+  printf("avg count poinst in fragment = %d\n", tlo->totalPoints / countTlo);
 
   return 1;
 }
@@ -662,6 +881,18 @@ static void drawMesh(TloRender* tlo, GLuint prog, int withZones) {
 
   glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
   glLineWidth(1.0f);
+
+  // 4) посадочные окружности радиуса ЛА в центрах зон (режим 3)
+  if (withZones && tlo->countCircleVerts > 0 && tlo->vao_circles) {
+    glUniform1i(passLoc, 4);
+    glDepthFunc(GL_LEQUAL);
+    glLineWidth(3.0f);
+    glBindVertexArray(tlo->vao_circles);
+    glDrawArrays(GL_LINES, 0, tlo->countCircleVerts);
+    glLineWidth(1.0f);
+    glDepthFunc(GL_LESS);
+  }
+
   glBindVertexArray(0);
   glEnable(GL_CULL_FACE);
 }
@@ -692,13 +923,26 @@ char drawTlo(TloRender* tlo, GLuint shaderProg) {
 }
 
 void freeTlo(TloRender* tlo) {
-  if (tlo->vao_points) glDeleteVertexArrays(1, &tlo->vao_points);
-  if (tlo->vao_tri)    glDeleteVertexArrays(1, &tlo->vao_tri);
-  if (tlo->vao_zone)   glDeleteVertexArrays(1, &tlo->vao_zone);
-  if (tlo->vbo_points) glDeleteBuffers(1, &tlo->vbo_points);
-  if (tlo->vbo_tri)    glDeleteBuffers(1, &tlo->vbo_tri);
-  if (tlo->ebo)        glDeleteBuffers(1, &tlo->ebo);
-  if (tlo->vbo_zone)   glDeleteBuffers(1, &tlo->vbo_zone);
+  // дождаться завершения фоновой пересборки, если она ещё идёт
+  if (g_rebuild.hasThread) {
+    pthread_join(g_rebuild.thread, NULL);
+    g_rebuild.hasThread = 0;
+    freeTriangResult(&g_rebuild.result);
+    g_rebuild.state = REBUILD_IDLE;
+  }
+  if (tlo->vao_points)  glDeleteVertexArrays(1, &tlo->vao_points);
+  if (tlo->vao_tri)     glDeleteVertexArrays(1, &tlo->vao_tri);
+  if (tlo->vao_zone)    glDeleteVertexArrays(1, &tlo->vao_zone);
+  if (tlo->vao_circles) glDeleteVertexArrays(1, &tlo->vao_circles);
+  if (tlo->vbo_points)  glDeleteBuffers(1, &tlo->vbo_points);
+  if (tlo->vbo_tri)     glDeleteBuffers(1, &tlo->vbo_tri);
+  if (tlo->ebo)         glDeleteBuffers(1, &tlo->ebo);
+  if (tlo->vbo_zone)    glDeleteBuffers(1, &tlo->vbo_zone);
+  if (tlo->vbo_circles) glDeleteBuffers(1, &tlo->vbo_circles);
+  free(tlo->cloud);
+  tlo->cloud = NULL;
+  tlo->cloudCount = 0;
   tlo->totalPoints = tlo->countTriangles = tlo->countZoneVerts = 0;
+  tlo->countCircleVerts = 0;
   tlo->is_loaded = 0;
 }

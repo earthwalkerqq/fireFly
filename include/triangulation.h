@@ -45,10 +45,10 @@ typedef int (*tri_correct_fn)(const Triangle* tri, const point_t* points);
  * @details
  * Реализация самодостаточная и не использует сторонние библиотеки из @c deps.
  * При большом количестве точек входное облако прореживается до внутреннего
- * лимита, затем точки сортируются и очищаются от XY-дубликатов. Поиск треугольников,
- * окружности которых нарушены очередной точкой, выполняется параллельно через
- * POSIX threads. Число потоков можно ограничить переменной окружения
- * @c FIREFLY_TRI_THREADS.
+ * лимита, очищается от XY-дубликатов и упорядочивается вдоль кривой Гильберта.
+ * Благодаря пространственной локальности этого порядка каждая вставляемая
+ * точка находит свою каверну локальным обходом смежных треугольников (поиск
+ * по соседям + обход в ширину), не перебирая все треугольники.
  *
  * @param[in,out] points Массив точек. Функция может переупорядочить и
  *   проредить первые @p num_points элементов.
@@ -63,6 +63,22 @@ Triangle *delaunay_triangulation(point_t *points, int *num_points,
                                  int *num_triangles);
 
 /**
+ * @brief Устанавливает предельное число точек, передаваемых в триангуляцию.
+ * @details
+ * Этот предел управляет густотой триангуляционной сетки: при превышении
+ * входное облако прореживается до указанного значения. Ранее предел
+ * задавался макросом на этапе компиляции; теперь он изменяется в реальном
+ * времени. Значение ограничивается снизу безопасным минимумом.
+ * @param maxPoints Желаемый предел числа точек триангуляции.
+ */
+void triangulation_set_max_points(int maxPoints);
+
+/**
+ * @brief Возвращает текущий предел числа точек триангуляции (густоту сетки).
+ */
+int triangulation_get_max_points(void);
+
+/**
  * @brief Находит связные области корректных треугольников и их контуры.
  * @details
  * Всем корректным треугольникам проставляется @c tri[i].numPolygon = 1..K,
@@ -74,7 +90,13 @@ Triangle *delaunay_triangulation(point_t *points, int *num_points,
  * @param countTriangle Количество треугольников.
  * @param points Массив точек.
  * @param countPoints Количество точек.
- * @param is_correct Предикат корректности треугольника.
+ * @param is_correct Предикат корректности треугольника. Может быть @c NULL,
+ *   если задан @p precomputed.
+ * @param precomputed Необязательная готовая классификация треугольников
+ *   (массив 0/1 размера @p countTriangle), полученная внешним модулем
+ *   (например, на устройстве OpenCL). Если не @c NULL, используется вместо
+ *   вызова @p is_correct; в этом случае распараллеленная классификация на
+ *   CPU не выполняется.
  * @param[out] outPolys Массив контуров. Освобождается через
  *   @ref triangulation_free_polygons.
  * @return Количество контуров в @p outPolys.
@@ -82,6 +104,7 @@ Triangle *delaunay_triangulation(point_t *points, int *num_points,
 size_t triangulation_find_polygons(Triangle* tri, size_t countTriangle,
                                    const point_t* points, size_t countPoints,
                                    tri_correct_fn is_correct,
+                                   const unsigned char* precomputed,
                                    polygon_t** outPolys);
 
 /**
