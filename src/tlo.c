@@ -503,7 +503,8 @@ static int computeTriang(const point_t* cloud, int cloudCount,
       (unsigned char*)calloc((size_t)countTriangles, 1);
   double* triClearance =
       (double*)calloc((size_t)countTriangles, sizeof(double));
-  size_t dbgCorrectTri = 0, dbgSafeTri = 0;
+  // переменные для дебага
+  size_t __attribute__((unused)) dbgCorrectTri = 0, dbgSafeTri = 0;
   double dbgMaxClr = 0.0;
   if (triIsSafe && triClearance && polyCount > 0 && maxPid > 0) {
     for (int ti = 0; ti < countTriangles; ti++) {
@@ -548,7 +549,7 @@ static int computeTriang(const point_t* cloud, int cloudCount,
   if (triRank && triIsSafe) {
     numZones = rankSafeZones(triangles, (size_t)countTriangles, triPoints,
                              triIsSafe, triClearance, maxPid,
-                             zoneWeightsDefault(), &zones, triRank);
+                             zoneWeightsDefault(), RADIUS_LA, &zones, triRank);
     size_t safeCount = 0;
     for (int i = 0; i < countTriangles; i++)
       if (triRank[i] >= 0) safeCount++;
@@ -616,11 +617,13 @@ static int computeTriang(const point_t* cloud, int cloudCount,
     }
   }
 
+  #ifdef DEGUB
   printf("[zones] points=%d tris=%d polys=%zu correctTri=%zu maxPid=%u "
          "clrLimit=%.1f maxClr=%.2f safeTri=%zu safeZones=%zu zoneVerts=%d circles=%d\n",
          countPoints, countTriangles, polyCount, dbgCorrectTri, maxPid,
          (double)RADIUS_LA, dbgMaxClr, dbgSafeTri, numZones,
          zoneVertCount, circleVertCount / (2 * CIRCLE_SEG));
+  #endif
 
   triangulation_free_polygons(polys, polyCount);
   free(zones);

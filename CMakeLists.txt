@@ -16,6 +16,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(USE_OPENCL "Сборка с поддержкой OpenCL" ON)
+option(DEBUG "Сборка в дебаг режиме" ON)
 
 # Исполняемый файл размещается рядом с каталогами shaders/ и kernels/.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})

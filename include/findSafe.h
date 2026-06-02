@@ -73,18 +73,21 @@ ZoneWeights zoneWeightsDefault(void);
  * @param triClearance Удаление треугольника от опасных границ, размер @p countTri.
  * @param maxPid       Наибольший идентификатор связной области.
  * @param w            Весовые коэффициенты интегрального показателя.
+ * @param landingRadius Радиус посадочного диска ЛА. Используется для заливки:
+ *   ранг зоны получают треугольники, попадающие внутрь посадочного диска
+ *   зоны (на расстоянии не больше @p landingRadius от её центра).
  * @param[out] outZones Массив зон, отсортированный по убыванию @c score.
  *   Освобождается через @c free(); при отсутствии зон устанавливается в @c NULL.
- * @param[out] triRank  Опциональный массив (размер @p countTri): для каждого
- *   треугольника, принадлежащего квалифицированной зоне (в которую вписывается
- *   хотя бы один диск ЛА), — ранг этой зоны; для остальных — @c -1. Таким
- *   образом заливкой покрывается вся корректная область зоны, а не только
- *   её безопасное ядро.
+ * @param[out] triRank  Опциональный массив (размер @p countTri): ранг зоны
+ *   получают треугольники, которые либо попадают внутрь идеального посадочного
+ *   диска зоны (круг радиуса @p landingRadius вокруг её центра), либо сами
+ *   являются допустимым местом вписания окружности ЛА (triIsSafe) — менее
+ *   релевантные кандидаты в том же полигоне. Для остальных — @c -1.
  * @return Количество найденных безопасных зон.
  */
 size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
                      const unsigned char *triIsSafe, const double *triClearance,
-                     unsigned maxPid, ZoneWeights w,
+                     unsigned maxPid, ZoneWeights w, double landingRadius,
                      SafeZone **outZones, int *triRank);
 
 #endif

@@ -20,7 +20,7 @@
 
 /*
  * Режим отображения
- * 1 - цветное отображение тло (цвет зависит от величины удаления от рельефа) 
+ * 1 - цветное отображение тло (цвет зависит от величины удаления от рельефа)
  * 2 - серое отображение триангуляционной сетки
  * 3 - триангуляционная сетка с подсвеченными безопасными зонами посадки
 */
@@ -34,17 +34,25 @@ extern char drawMode;
 #define MIN_SIZE_TRIANGL 800
 #define MAX_SIZE_TRIANGL 40000
 
-vec3 cameraPos = {0.f, 0.f, 0.f};
-vec3 cameraFront = {0.f, 1.f, 0.f};  // направление взгляда (по оси Y)
-vec3 cameraUp = {0.f, 0.f, 1.f};     // направление вверх (ось Z)
+#define DEFAULT_CAMERA_SPEED 1.
 
-// запрос на пересборку триангуляции после изменения густоты сетки
+struct {
+	vec3 cameraPos;
+	vec3 cameraFront;
+	vec3 cameraUp;
+} g_camera_state = {
+	.cameraPos = {0.f, 0.f, 0.f},
+	.cameraFront = {0.f, 1.f, 0.f},
+	.cameraUp = {0.f, 0.f, 1.f}
+};
+
+/* флаг на песборку триангуляционной сетки */
 static int g_MeshRebuildRequest = 0;
 
-static float pitch = 0.f; // вертикальный поворот
-static float yaw = -90.f; // горизонтальный поворот
+static float g_pitch = 0.f; /* вертикальный поворот */
+static float g_yaw = -90.f; /* горизонтальный поворот */
 
-static float cameraSpeed = 2.f;
+static float g_cameraSpeed = DEFAULT_CAMERA_SPEED;
 
 static GLFWwindow* _glfwGetWindow(int win_width, int win_height) {
   if (!glfwInit()) {
@@ -83,7 +91,7 @@ static void _glSetup(void) {
 }
 
 void keyCallback(GLFWwindow* window, float deltaTime) {
-    float currentSpeed = 20 * cameraSpeed * deltaTime;
+    float currentSpeed = 20 * g_cameraSpeed * deltaTime;
 
     if (glfwGetKey(window, GLFW_KEY_1) == GLFW_PRESS) {
       drawMode = 1;
@@ -120,69 +128,75 @@ void keyCallback(GLFWwindow* window, float deltaTime) {
 
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
         vec3 resMul;
-        glm_vec3_scale(cameraFront, currentSpeed, resMul);
-        glm_vec3_add(cameraPos, resMul, cameraPos);
+        glm_vec3_scale(g_camera_state.cameraFront, currentSpeed, resMul);
+        glm_vec3_add(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
     if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
         vec3 resMul;
-        glm_vec3_scale(cameraFront, currentSpeed, resMul);
-        glm_vec3_sub(cameraPos, resMul, cameraPos);
+        glm_vec3_scale(g_camera_state.cameraFront, currentSpeed, resMul);
+        glm_vec3_sub(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
     if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
         vec3 res;
-        glm_vec3_cross(cameraFront, cameraUp, res);
+        glm_vec3_cross(g_camera_state.cameraFront, g_camera_state.cameraUp, res);
         vec3 normVec;
         glm_vec3_normalize_to(res, normVec);
         vec3 resMul;
         glm_vec3_scale(normVec, currentSpeed, resMul);
-        glm_vec3_sub(cameraPos, resMul, cameraPos);
+        glm_vec3_sub(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
     if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
         vec3 res;
-        glm_vec3_cross(cameraFront, cameraUp, res);
+        glm_vec3_cross(g_camera_state.cameraFront, g_camera_state.cameraUp, res);
         vec3 normVec;
         glm_vec3_normalize_to(res, normVec);
         vec3 resMul;
         glm_vec3_scale(normVec, currentSpeed, resMul);
-        glm_vec3_add(cameraPos, resMul, cameraPos);
+        glm_vec3_add(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
     if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
         vec3 resMul;
-        glm_vec3_scale(cameraUp, currentSpeed, resMul);
-        glm_vec3_add(cameraPos, resMul, cameraPos);
+        glm_vec3_scale(g_camera_state.cameraUp, currentSpeed, resMul);
+        glm_vec3_add(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
-    if (glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+	if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
         vec3 resMul;
-        glm_vec3_scale(cameraUp, currentSpeed, resMul);
-        glm_vec3_sub(cameraPos, resMul, cameraPos);
+        glm_vec3_scale(g_camera_state.cameraUp, currentSpeed, resMul);
+        glm_vec3_sub(g_camera_state.cameraPos, resMul, g_camera_state.cameraPos);
     }
+	if (glfwGetKey(window, GLFW_KEY_EQUAL) == GLFW_PRESS) {
+		g_cameraSpeed += 0.5;
+	}
+	if (glfwGetKey(window, GLFW_KEY_MINUS) == GLFW_PRESS) {
+		g_cameraSpeed -= 0.5;
+	}
     if (glfwGetKey(window, GLFW_KEY_O) == GLFW_PRESS) {
-      yaw += 0.5f;
+      g_yaw += 0.5f;
     }
     if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS) {
-      yaw -= 0.5f;
+      g_yaw -= 0.5f;
     }
     if (glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS) {
-      pitch -= 0.5f;
+      g_pitch -= 0.5f;
     }
     if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS) {
-      pitch += 0.5f;
+      g_pitch += 0.5f;
     }
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS ||
         glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
       glfwSetWindowShouldClose(window, GL_TRUE);
     }
 
-    if (pitch < -89.f) pitch = -89.f;
-    else if (pitch > 89.f) pitch = 89.f;
+    if (g_pitch < -89.f) g_pitch = -89.f;
+    else if (g_pitch > 89.f) g_pitch = 89.f;
 
     // вычисляем направление взгляда
     // горизонталь: плоскость X-Y, высота: Z
     vec3 front;
-    front[0] = cosf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // x
-    front[1] = sinf(glm_rad(yaw)) * cosf(glm_rad(pitch)); // y
-    front[2] = sinf(glm_rad(pitch));                      // z
-    glm_vec3_normalize_to(front, cameraFront);
+    front[0] = cosf(glm_rad(g_yaw)) * cosf(glm_rad(g_pitch)); // x
+    front[1] = sinf(glm_rad(g_yaw)) * cosf(glm_rad(g_pitch)); // y
+    front[2] = sinf(glm_rad(g_pitch));                      // z
+    glm_vec3_normalize_to(front, g_camera_state.cameraFront);
 }
 
 void mouseCallback(GLFWwindow* window, int button, int action, int __attribute__((unused)) mods) {
@@ -228,8 +242,8 @@ void mainloop(GLFWwindow* window, TloRender* tlo, GLuint shaderProg) {
 
     mat4 view;
     vec3 center;
-    glm_vec3_add(cameraPos, cameraFront, center);
-    glm_lookat(cameraPos, center, cameraUp, view);
+    glm_vec3_add(g_camera_state.cameraPos, g_camera_state.cameraFront, center);
+    glm_lookat(g_camera_state.cameraPos, center, g_camera_state.cameraUp, view);
 
     mat4 projection;
     glm_perspective(glm_rad(70.f), (float)(winWidth) / winHeight, 0.1f, 10000.f, projection);
@@ -317,16 +331,16 @@ int main(int argc, char** argv) {
   float centerY = (tlo.minY + tlo.maxY) * 0.5f;
   float centerZ = (tlo.minZ + tlo.maxZ) * 0.5f;
 
-  cameraPos[0] = centerX;
-  cameraPos[1] = centerY;
-  cameraPos[2] = centerZ + (tlo.maxZ - tlo.minZ) * 0.5f + 100.0f;
+  g_camera_state.cameraPos[0] = centerX;
+  g_camera_state.cameraPos[1] = centerY;
+  g_camera_state.cameraPos[2] = centerZ + (tlo.maxZ - tlo.minZ) * 0.5f + 100.0f;
 
   vec3 lookAt;
   lookAt[0] = centerX;
   lookAt[1] = centerY;
   lookAt[2] = centerZ;
-  glm_vec3_sub(lookAt, cameraPos, cameraFront);
-  glm_vec3_normalize(cameraFront);
+  glm_vec3_sub(lookAt, g_camera_state.cameraPos, g_camera_state.cameraFront);
+  glm_vec3_normalize(g_camera_state.cameraFront);
 
   GLuint shaderProg = createShader(PATH_VRX_SHADER, PATH_FRG_SHADER);
   if (!shaderProg) {

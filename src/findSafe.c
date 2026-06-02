@@ -73,7 +73,7 @@ static int cmpZoneByScore(const void *lhs, const void *rhs) {
 
 size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
                      const unsigned char *triIsSafe, const double *triClearance,
-                     unsigned maxPid, ZoneWeights w,
+                     unsigned maxPid, ZoneWeights w, double landingRadius,
                      SafeZone **outZones, int *triRank) {
   if (outZones) *outZones = NULL;
   if (triRank) {
@@ -242,25 +242,50 @@ size_t rankSafeZones(const Triangle *tri, size_t countTri, const point_t *pts,
   qsort(zones, numZones, sizeof(SafeZone), cmpZoneByScore);
   for (size_t i = 0; i < numZones; i++) zones[i].rank = (int)i;
 
-  /* Проставление ранга зоны каждому безопасному треугольнику. */
+  /* Проставление ранга зоны треугольникам её посадочного диска. */
   if (triRank) {
-    int *pidRank = (int *)malloc((size_t)(maxPid + 1) * sizeof(int));
-    if (pidRank) {
+    int    *pidRank = (int *)malloc((size_t)(maxPid + 1) * sizeof(int));
+    double *pidCx   = (double *)malloc((size_t)(maxPid + 1) * sizeof(double));
+    double *pidCy   = (double *)malloc((size_t)(maxPid + 1) * sizeof(double));
+    if (pidRank && pidCx && pidCy) {
       for (unsigned p = 0; p <= maxPid; p++) pidRank[p] = -1;
-      for (size_t i = 0; i < numZones; i++)
+      for (size_t i = 0; i < numZones; i++) {
         pidRank[zones[i].pid] = zones[i].rank;
-      /* Ранг (а значит и заливку) получает ВСЯ связная корректная область
-         зоны, прошедшей отбор (pidRank>=0, т.е. в ней помещается хотя бы один
-         посадочный круг ЛА), а не только эрозированное ядро безопасных
-         треугольников. Так заливка совпадает с подсвеченной зоной, а
-         окружность лишь отмечает конкретное место под аппарат. */
+        pidCx[zones[i].pid]   = zones[i].cx;
+        pidCy[zones[i].pid]   = zones[i].cy;
+      }
+      /* Ранг зоны (и заливку) получают треугольники двух категорий:
+         1) идеальный посадочный диск — те, что попадают в круг радиуса
+            landingRadius вокруг центра зоны (там же белый контур); это
+            гарантирует, что подсвеченный круг залит целиком;
+         2) прочие места в полигоне, куда вписывается окружность ЛА
+            (triIsSafe) — менее релевантные, но тоже пригодные кандидаты.
+         Проверка pid не даёт заливке вытечь за пределы своей связной
+         области, даже если диск геометрически перекрывает соседнюю. */
+      double r2 = landingRadius * landingRadius;
       for (size_t ti = 0; ti < countTri; ti++) {
         unsigned pid = tri[ti].numPolygon;
-        if (pid >= 1 && pid <= maxPid && pidRank[pid] >= 0)
+        if (pid < 1 || pid > maxPid || pidRank[pid] < 0)
+          continue;
+
+        int inZone = triIsSafe[ti]; /* допустимый центр посадки */
+        if (!inZone) {
+          const point_t *a = &pts[tri[ti].p1];
+          const point_t *b = &pts[tri[ti].p2];
+          const point_t *c = &pts[tri[ti].p3];
+          double cx = ((double)a->x + b->x + c->x) / 3.0;
+          double cy = ((double)a->y + b->y + c->y) / 3.0;
+          double dx = cx - pidCx[pid];
+          double dy = cy - pidCy[pid];
+          inZone = (dx * dx + dy * dy <= r2); /* внутри идеального диска */
+        }
+        if (inZone)
           triRank[ti] = pidRank[pid];
       }
-      free(pidRank);
     }
+    free(pidRank);
+    free(pidCx);
+    free(pidCy);
   }
 
   if (outZones) *outZones = zones;

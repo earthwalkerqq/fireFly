@@ -6,17 +6,22 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "hash.h"
 #include "triangulation.h"
 #include "common.h"
 
 #define MAX_TRIANG_POINTS_DEFAULT 12000
 #define TRI_MAX_WORKERS 8
 #define TRI_PARALLEL_MIN_ITEMS 512
-#define HILBERT_ORDER 16          /* разрешение сетки Гильберта: сторона 2^16 */
+#define MAX_HILBERT_ORDER 16          /* разрешение сетки Гильберта: сторона 2^16 */
 #define POINT_EPS 1e-6
 #define AREA_EPS 1e-12
 #define CIRCLE_EPS 1e-9
 #define CAP_DEFAULT 64
+
+#ifndef INFINITY
+#define INFINITY 1e30
+#endif
 
 /*
  * Предельное число точек, передаваемых в триангуляцию.
@@ -33,10 +38,6 @@ int triangulation_get_max_points(void) {
   return g_max_triang_points;
 }
 
-#ifndef INFINITY
-#define INFINITY 1e30
-#endif
-
 /**
  * @brief Внутреннее представление треугольника Bowyer-Watson.
  * @details Помимо индексов вершин и описанной окружности хранит индексы
@@ -46,11 +47,11 @@ int triangulation_get_max_points(void) {
  * локальным обходом, не перебирая все треугольники.
  */
 typedef struct {
-  int p[3];               /**< Индексы вершин (обход против часовой стрелки). */
-  int n[3];               /**< Соседи по рёбрам или -1. */
-  double cx, cy, r2;      /**< Центр и квадрат радиуса описанной окружности. */
-  unsigned char alive;    /**< Жив ли треугольник. */
-  unsigned char visited;  /**< Метка обхода каверны (сбрасывается после вставки). */
+  int p[3];               /* Индексы вершин (обход против часовой стрелки) */
+  int n[3];               /* Соседи по рёбрам (если нет соседа, то -1) */
+  double cx, cy, r2;      /* Центр и квадрат радиуса описанной окружности */
+  unsigned char alive;    /* Жив ли треугольник */
+  unsigned char visited;  /* Метка обхода (сбрасывается после вставки) */
 } bw_triangle_t;
 
 /**
@@ -95,6 +96,8 @@ typedef struct {
 
 /**
  * @brief Вычисляет ориентированную удвоенную площадь треугольника в XY
+ * @details будет использоваться для определения, с какой стороны от ребра
+ * находится точка.
  */
 static double orient2d(const point_t* a, const point_t* b, const point_t* c) {
   return ((double)b->x - (double)a->x) * ((double)c->y - (double)a->y) -
@@ -126,9 +129,6 @@ static int same_point_xy(const point_t* a, const point_t* b) {
 /**
  * @brief Переводит координаты ячейки (x,y) в расстояние вдоль кривой Гильберта.
  * @details Классический алгоритм d = xy2d для квадрата со стороной @p n
- * (степень двойки). Кривая Гильберта обходит плоскость так, что соседние по
- * номеру ячейки близки в пространстве, поэтому упорядочивание точек по этому
- * номеру даёт сильную пространственную локальность.
  */
 static uint64_t hilbert_xy2d(uint32_t n, uint32_t x, uint32_t y) {
   uint64_t d = 0;
@@ -151,7 +151,7 @@ static uint64_t hilbert_xy2d(uint32_t n, uint32_t x, uint32_t y) {
 }
 
 /**
- * @brief Сравнивает ключи Гильберта для qsort.
+ * @brief Функция предикат для qsort
  */
 static int cmp_hkey(const void* lhs, const void* rhs) {
   const hkey_t* a = (const hkey_t*)lhs;
@@ -170,10 +170,11 @@ static int cmp_hkey(const void* lhs, const void* rhs) {
  * что позволяет находить каверну локальным обходом смежных треугольников.
  * При нехватке памяти исходный порядок сохраняется (на корректность не влияет).
  */
-static void hilbert_sort(point_t* points, int n) {
+static void hilbert_sort(point_t* points, int n, int hil_order) {
   if (n < 2)
     return;
 
+  /* нахождение ограничевающего прямоугольника */
   double min_x = points[0].x, max_x = points[0].x;
   double min_y = points[0].y, max_y = points[0].y;
   for (int i = 1; i < n; i++) {
@@ -183,18 +184,21 @@ static void hilbert_sort(point_t* points, int n) {
     else if (points[i].y > max_y) max_y = points[i].y;
   }
 
-  const uint32_t side = 1u << HILBERT_ORDER;
+  /* размер сетки - степень двойки */
+  const uint32_t side = 1u << hil_order;
   double sx = (max_x > min_x) ? (max_x - min_x) : 1.0;
   double sy = (max_y > min_y) ? (max_y - min_y) : 1.0;
 
   hkey_t* keys = (hkey_t*)malloc((size_t)n * sizeof(hkey_t));
   point_t* tmp = (point_t*)malloc((size_t)n * sizeof(point_t));
   if (!keys || !tmp) {
+    fprintf(stderr, "FAIL FROM MEMORY ALLOCATE\n");
     free(keys);
     free(tmp);
     return;
   }
 
+  /* точки на кривой Гильберта близки в пространстве, но наоборот работет не всегда */
   for (int i = 0; i < n; i++) {
     uint32_t gx = (uint32_t)(((double)points[i].x - min_x) / sx * (side - 1));
     uint32_t gy = (uint32_t)(((double)points[i].y - min_y) / sy * (side - 1));
@@ -255,16 +259,16 @@ static int triangulation_worker_count(size_t work_items) {
   p.s. Пробовал делать 1. с выборором той точки, которая будет ближе всех к центру ячейки;
   2. с выбором точки, которая явлсяется локальным максимумом в ячейке. В первом случае, при выборе
   большого размера конечного элемента сетки, не учитываются возможные припятствия, а во втором
-  случает сетка получается сильно шероховатой. 
+  случает сетка получается сильно шероховатой.
  */
-static int subsample(point_t* points, int n) {
+static int subsample(point_t* points, int* n) {
   int maxPoints = g_max_triang_points;
-  if (n <= maxPoints)
-    return n;
+  if (*n <= maxPoints)
+    return (int)ceil(sqrt((double)*n));
 
   double min_x = points[0].x, max_x = points[0].x;
   double min_y = points[0].y, max_y = points[0].y;
-  for (int i = 1; i < n; i++) {
+  for (int i = 1; i < *n; i++) {
     if (points[i].x < min_x) min_x = points[i].x;
     else if (points[i].x > max_x) max_x = points[i].x;
     if (points[i].y < min_y) min_y = points[i].y;
@@ -274,18 +278,20 @@ static int subsample(point_t* points, int n) {
   int g = (int)ceil(sqrt((double)maxPoints)); // размер регулярной сетки
   if (g < 3) g = 3;
 
-  // аккумуляторы координат по ячейкам сетки
+  /* аккумудяторы по ячейкам */
   size_t cells = (size_t)g * (size_t)g;
-  double* accX = (double*)calloc(cells, sizeof(double)); // сумма координат X
-  double* accY = (double*)calloc(cells, sizeof(double)); // сумма координат Y
-  double* accZ = (double*)calloc(cells, sizeof(double)); // сумма координат Z
-  double* accH = (double*)calloc(cells, sizeof(double)); // сумма высот рельефа (только для точек с корректной высотой)
-  int*    cnt  = (int*)calloc(cells, sizeof(int)); // общее число точек в ячейке
-  int*    cntH = (int*)calloc(cells, sizeof(int)); // количество точек в ячейке, у которых height >= 0
-  if (!accX || !accY || !accZ || !accH || !cnt || !cntH) {
+  double* accX = (double*)calloc(cells, sizeof(double));
+  double* accY = (double*)calloc(cells, sizeof(double));
+  double* accZ = (double*)calloc(cells, sizeof(double));
+  double* accH = (double*)calloc(cells, sizeof(double));
+  int*    cnt  = (int*)calloc(cells, sizeof(int));
+  int*    cntH = (int*)calloc(cells, sizeof(int));
+  point_t* tmp = (point_t*)malloc(cells * sizeof(point_t));
+  if (!accX || !accY || !accZ || !accH || !cnt || !cntH || !tmp) {
     fprintf(stderr, "FAIL FROM MEMORY ALLOCATE\n");
     memDestroy(6, accX, accY, accZ, accH, cnt, cntH);
-    return n;
+    free(tmp);
+    return g;
   }
 
   // размер ячейки
@@ -293,7 +299,7 @@ static int subsample(point_t* points, int n) {
   double sy = (max_y > min_y) ? (max_y - min_y) / g : 1.0;
 
   // распределяем точки по ячейкам
-  for (int i = 0; i < n; i++) {
+  for (int i = 0; i < *n; i++) {
     int gx = (int)(((double)points[i].x - min_x) / sx);
     int gy = (int)(((double)points[i].y - min_y) / sy);
 
@@ -315,13 +321,6 @@ static int subsample(point_t* points, int n) {
     }
   }
 
-  point_t* tmp = (point_t*)malloc(cells * sizeof(point_t));
-  if (!tmp) {
-    fprintf(stderr, "FAIL FROM MEMORY ALLOCATE\n");
-    memDestroy(6, accX, accY, accZ, accH, cnt, cntH);
-    return n;
-  }
-
   int out = 0;
   for (size_t i = 0; i < cells; i++) {
     if (cnt[i] == 0) continue;
@@ -339,19 +338,31 @@ static int subsample(point_t* points, int n) {
 
   if (out >= 3) {
     memcpy(points, tmp, (size_t)out * sizeof(point_t));
-    free(tmp);
-    return out;
+    *n = out;
   }
 
   free(tmp);
-  return n;
+  return g;
+}
+
+/**
+ * @brief Порядок (число бит) сетки Гильберта, сторона которой не меньше @p g.
+ * @details hilbert_sort использует side = 1u << order, поэтому здесь нужен
+ * именно показатель степени: наименьший order, при котором 2^order >= g.
+ * Значение ограничено сверху 16 битами (сторона до 65536) и снизу 1.
+ */
+static int hilbert_order_for(int g) {
+  int order = 1;
+  while ((1 << order) < g && order < MAX_HILBERT_ORDER)
+    order++;
+  return order;
 }
 
 /**
  * @brief Сортирует точки и удаляет XY-дубликаты.
  */
 static int normalize_points(point_t* points, int n) {
-  n = subsample(points, n);
+  int g = subsample(points, &n);
   if (n < 3)
     return n;
 
@@ -364,8 +375,12 @@ static int normalize_points(point_t* points, int n) {
       points[out++] = points[i];
   }
 
-  /* итоговый порядок вставки — вдоль кривой Гильберта (локальность каверны) */
-  hilbert_sort(points, out);
+  int hil_order = hilbert_order_for(g);
+  #ifdef DEBUG
+  printf("\nHILBERT_ORDER = %d\n", hil_order);
+  #endif
+  /* итоговый порядок вставки — вдоль кривой Гильберта */
+  hilbert_sort(points, out, hil_order);
 
   return out;
 }
@@ -376,7 +391,7 @@ static int normalize_points(point_t* points, int n) {
  * ориентированной площади треугольника:
  *         | ax ay 1 |
  * d = 2 * | bx by 1 |
-​ *         | cx cy 1 |
+ *         | cx cy 1 |
  * @param cpx - координата центра окр-ти по X
  * @param cpy - координата центра окр-ти по Y
  * @param r2 - удвоенный радиус окр-ти
@@ -518,7 +533,7 @@ static int bw_back_edge(const bw_mesh_t* m, int nb, int t) {
 }
 
 /**
- * @brief Локализует треугольник, содержащий точку, «шагая» по смежности.
+ * @brief Локализует треугольник, содержащий точку, шагая по смежности.
  * @details Старт из подсказки @p hint (обычно треугольник предыдущей
  * вставки — при гильбертовом порядке он рядом). На каждом шаге переходим
  * через ребро, относительно которого точка лежит снаружи. Так как точки
@@ -537,6 +552,11 @@ static int bw_locate(const bw_mesh_t* m, int hint, const point_t* points,
   if (cur < 0)
     return -1;
 
+  /* Формула-защита от бесконечного цикла. Кажется, что в худшем случае нахождение треугольника
+   * происходит за m->count операций, но ведь он может пойти каким-то супер неоптимальным путем
+   * и тогда возможно повторение треугольников -> больше итераций. Пока обход сделан с небольшим запасом,
+   * наверное лучше сделать с отслеживанием пройденных треугольников.
+   */
   size_t guard = 4 * m->count + 16;
   for (size_t step = 0; step < guard; step++) {
     const bw_triangle_t* t = &m->tris[cur];
@@ -545,8 +565,9 @@ static int bw_locate(const bw_mesh_t* m, int hint, const point_t* points,
       const point_t* u = &points[t->p[e]];
       const point_t* v = &points[t->p[(e + 1) % 3]];
       if (orient2d(u, v, p) < 0.0) {
+        // точка слева от ребра u-v -> нужно перейти к соседнему треугольнику
         int nb = t->n[e];
-        if (nb >= 0) {
+        if (nb != -1) {
           cur = nb;
           moved = 1;
           break;
@@ -559,10 +580,12 @@ static int bw_locate(const bw_mesh_t* m, int hint, const point_t* points,
   return cur;
 }
 
+/* Динамическое расширение массива. Нужно лишь при работе
+ * функции вставки точки, поэтому в виде макроса */
 #define BW_GROW_INT(buf, cap, cnt)                         \
   do {                                                     \
     if ((cnt) == *(cap)) {                                 \
-      size_t nc = *(cap) ? *(cap) * 2 : 64;                \
+      size_t nc = *(cap) ? *(cap) * 2 : CAP_DEFAULT;                \
       int* r = (int*)realloc(*(buf), nc * sizeof(int));    \
       if (!r) return 0;                                    \
       *(buf) = r; *(cap) = nc;                             \
@@ -572,7 +595,7 @@ static int bw_locate(const bw_mesh_t* m, int hint, const point_t* points,
 /**
  * @brief Вставляет точку @p pi, перестраивая каверну Делоне локально.
  * @details
- *  1. Находим стартовый «плохой» треугольник (его описанная окружность
+ *  1. Находим стартовый плохой треугольник (его описанная окружность
  *     содержит точку) локализацией по смежности — без перебора всех
  *     треугольников.
  *  2. Обходом в ширину собираем всю каверну — связную область плохих
@@ -597,7 +620,7 @@ static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
 
   int seed = bw_locate(m, *hint, points, p);
   if (seed < 0 || !point_in_circumcircle(&m->tris[seed], p)) {
-    /* запасной путь: ищем любой плохой треугольник перебором */
+    /* если не удалось найти по локали, ищем любой плохой треугольник перебором */
     seed = -1;
     for (size_t i = 0; i < m->count; i++) {
       if (m->tris[i].alive && point_in_circumcircle(&m->tris[i], p)) {
@@ -609,7 +632,7 @@ static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
       return 1; /* точка не нарушает ни одной окружности — пропускаем */
   }
 
-  /* --- обход в ширину: собираем каверну плохих треугольников --- */
+  /* обход в ширину: собираем каверну плохих треугольников */
   size_t stackCnt = 0, touchedCnt = 0;
 
   BW_GROW_INT(stackBuf, stackCap, stackCnt);
@@ -622,7 +645,7 @@ static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
     int t = (*stackBuf)[--stackCnt];
     for (int e = 0; e < 3; e++) {
       int nb = m->tris[t].n[e];
-      if (nb < 0 || m->tris[nb].visited)
+      if (nb == -1 || m->tris[nb].visited)
         continue;
       if (m->tris[nb].alive && point_in_circumcircle(&m->tris[nb], p)) {
         m->tris[nb].visited = 1;
@@ -638,7 +661,7 @@ static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
   for (size_t i = 0; i < touchedCnt; i++)
     m->tris[(*touchedBuf)[i]].alive = 0;
 
-  /* --- граничные рёбра каверны --- */
+  /* граничные рёбра каверны */
   size_t bndCnt = 0;
   for (size_t i = 0; i < touchedCnt; i++) {
     int t = (*touchedBuf)[i];
@@ -646,7 +669,7 @@ static int bw_insert_point(bw_mesh_t* m, const point_t* points, int pi,
       int nb = m->tris[t].n[e];
       /* ребро граничное, если снаружи нет треугольника либо он жив
          (то есть не входит в каверну) */
-      if (nb >= 0 && !m->tris[nb].alive)
+      if (nb != -1 && !m->tris[nb].alive)
         continue;
 
       if (bndCnt == *bndCap) {
@@ -858,13 +881,7 @@ Triangle* delaunay_triangulation(point_t* points, int* num_points,
     }
   }
 
-  free(stackBuf);
-  free(touchedBuf);
-  free(newBuf);
-  free(bndA);
-  free(bndB);
-  free(bndOt);
-  free(bndOe);
+  memDestroy(7, stackBuf, touchedBuf, newBuf, bndA, bndB, bndOt, bndOe);
 
   Triangle* result = NULL;
   if (ok)
@@ -874,26 +891,6 @@ Triangle* delaunay_triangulation(point_t* points, int* num_points,
   free(mesh.freeList);
   free(work_points);
   return result;
-}
-
-static uint64_t edge_key_u32(int a, int b) {
-  uint32_t x = (uint32_t)a, y = (uint32_t)b;
-  return ((uint64_t)x << 32) | (uint64_t)y;
-}
-
-static size_t next_pow2(size_t v) {
-  size_t p = 1;
-  while (p < v) p <<= 1;
-  return p;
-}
-
-static size_t hash_u64(uint64_t x) {
-  // splitmix64
-  x += 0x9e3779b97f4a7c15ULL;
-  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
-  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-  x = x ^ (x >> 31);
-  return (size_t)x;
 }
 
 static int tri_vert(const Triangle* t, int i) {
@@ -1004,7 +1001,7 @@ size_t triangulation_find_polygons(Triangle* tri, size_t countTriangle,
   unsigned char* good = (unsigned char*)malloc(countTriangle);
   if (!good) return 0;
   if (precomputed) {
-    /* классификация уже выполнена внешним модулем (например, OpenCL) */
+    /* классификация уже выполнена внешним модулем */
     for (size_t i = 0; i < countTriangle; i++) {
       tri[i].numPolygon = 0;
       good[i] = precomputed[i] ? 1 : 0;
